@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 1: The Four Layers &mdash; SeaweedFS Architecture</title>
+<link rel="stylesheet" href="../assets/shared.css">
+<style>
+  .quiz { margin: 2rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+  .quiz h3 { margin-top: 0; }
+  .quiz-option { display: block; padding: 0.4rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 3px; border: 1px solid var(--border); background: var(--bg); font-family: inherit; font-size: 0.95em; color: var(--text); transition: background 0.15s; }
+  .quiz-option:hover { background: var(--accent-light); }
+  .quiz-option.correct { background: #c8e6c9; border-color: #66bb6a; }
+  .quiz-option.wrong { background: #ffcdd2; border-color: #ef5350; }
+  .feedback { margin-top: 0.5rem; padding: 0.5rem; border-radius: 3px; font-size: 0.9em; display: none; }
+  .feedback.show { display: block; }
+  .feedback.correct { background: #c8e6c9; }
+  .feedback.wrong { background: #ffcdd2; }
+  .check-btn { padding: 0.4rem 1.2rem; margin-top: 0.5rem; border: none; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; font-family: inherit; font-size: 0.9em; }
+  .check-btn:hover { opacity: 0.9; }
+  .check-btn:disabled { opacity: 0.5; cursor: default; }
+  .trace-step { margin: 0.5rem 0; padding: 0.5rem 1rem; border-left: 3px solid var(--accent); background: var(--accent-light); border-radius: 0 4px 4px 0; font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>Lesson 1: The Four Layers of the SeaweedFS Object Store</h1>
+
+<p>Before we can understand how SeaweedFS distributes <em>particular</em> kinds of data (S3 objects, buckets, users), we need to understand the <strong>layers</strong> that all data flows through. This lesson introduces the four-layer architecture and how each layer contributes to the distribution of data and metadata.</p>
+
+<h2>The Problem: Why Layers?</h2>
+
+<p>In a traditional distributed filesystem (like HDFS), a central NameNode stores a mapping of every filename to its chunks and chunk locations. This works for large files, but <strong>breaks down with billions of small files</strong> — the NameNode's in-memory metadata becomes the bottleneck.</p>
+
+<p>SeaweedFS solves this by splitting the problem across <strong>four layers</strong> with different responsibilities. No single component holds all the metadata.</p>
+
+<h2>The Four Layers</h2>
+
+<h3>Layer 1: Master Server — The Lightweight Coordinator</h3>
+
+<p>The master stores only <strong>volume-id → volume-server</strong> mappings and generates <strong>file keys</strong> for new writes. It does <em>not</em> know about files, directories, buckets, or users. Its data set is small and stable — typically a few thousand entries, even for petabyte-scale clusters.</p>
+
+<p>This is the key insight from <a href="http://www.usenix.org/event/osdi10/tech/full_papers/Beaver.pdf">Facebook's Haystack design paper</a>: by making volumes (not files) the unit of management, the coordinator stays tiny.</p>
+
+<h3>Layer 2: Volume Servers — The Data Plane</h3>
+
+<p>Volume servers store data in <strong>32 GB append-only volume files</strong>. Each volume is a sequential log of blobs (also called needles). A 16-byte in-memory index maps each blob's file key → (offset, size) within the volume. One disk read per blob access.</p>
+
+<p>Volume servers are entirely self-describing: they know everything about the blobs they store and need no master help to serve reads. They also handle replication (rack/data-center aware), compression, and TTL expiration.</p>
+
+<h3>Layer 3: Filer — The Namespace Layer</h3>
+
+<p>The filer adds a <strong>hierarchical directory/file view</strong> on top of the flat blob store. It stores directory structure and file metadata (name, size, content type, chunk list) in a pluggable external database — MySQL, Postgres, Redis, LevelDB, etc.</p>
+
+<p>A file in the filer doesn't contain data; it contains <strong>chunk references</strong>. Each chunk is a pointer to a blob on a volume server: <code>(volume_id, file_key, offset, size)</code>. Large files are split across multiple chunks, potentially on different volume servers.</p>
+
+<div class="note">
+<strong>Critical insight:</strong> The filer stores <em>metadata</em>, not data. When you GET an object, the filer tells the S3 API <em>where</em> the chunks are, but the actual bytes are streamed directly from volume servers to the client. The filer is never a data-path bottleneck.
+</div>
+
+<h3>Layer 4: S3 API Server — The Translation Layer</h3>
+
+<p>The S3 API server is a stateless HTTP server that translates S3 REST calls into filer operations:</p>
+
+<ul>
+  <li><strong>CreateBucket("photos")</strong> → <code>mkdir("/buckets/photos")</code> on the filer</li>
+  <li><strong>PutObject("photos", "sunset.jpg")</strong> → write file at <code>/buckets/photos/sunset.jpg</code> via the filer</li>
+  <li><strong>GetObject("photos", "sunset.jpg")</strong> → read filer entry for <code>/buckets/photos/sunset.jpg</code>, stream chunks directly from volume servers</li>
+  <li><strong>ListBuckets()</strong> → list directories under <code>/buckets</code></li>
+</ul>
+
+<p>It also handles <strong>authentication</strong> (AWS SigV4), <strong>authorization</strong> (IAM policies), <strong>CORS</strong>, <strong>versioning</strong>, <strong>SSE encryption</strong>, <strong>multipart uploads</strong>, and <strong>lifecycle policies</strong>. All of this is implemented in <code>weed/s3api/</code>.</p>
+
+<h2>How Data and Metadata are Distributed</h2>
+
+<table>
+  <tr><th>What</th><th>Where It Lives</th><th>How It Scales</th></tr>
+  <tr>
+    <td>Object data (bytes)</td>
+    <td>Volume servers, as blobs in append-only volume files</td>
+    <td>Add more volume servers. Volumes are the unit of distribution.</td>
+  </tr>
+  <tr>
+    <td>Object metadata (name, size, chunks, ETag)</td>
+    <td>Filer metadata store (Postgres, Redis, etc.)</td>
+    <td>Scale the filer metadata store independently (e.g., sharded Postgres).</td>
+  </tr>
+  <tr>
+    <td>Bucket metadata (owner, versioning, ACL, lifecycle, object lock)</td>
+    <td>Extended attributes on the filer directory entry for the bucket (e.g., <code>/buckets/photos</code>)</td>
+    <td>Same path as object metadata — scales with the filer store. Cached in-memory by BucketRegistry.</td>
+  </tr>
+  <tr>
+    <td>User credentials (access keys, secrets)</td>
+    <td>Filer (<code>/etc/iam/identities/</code>) or Postgres or memory</td>
+    <td>Scales with the chosen credential store.</td>
+  </tr>
+  <tr>
+    <td>IAM policies (bucket policies, roles)</td>
+    <td>Filer (<code>/etc/iam/policies/</code>) or in-memory</td>
+    <td>Loaded at startup or from config; evaluated in-memory by each S3 API server.</td>
+  </tr>
+  <tr>
+    <td>Volume-to-server mapping</td>
+    <td>Master server (in memory, replicated via Raft)</td>
+    <td>Thousands of volumes per master; millions handled by the volume-id → server lookup. Stable and cacheable.</td>
+  </tr>
+</table>
+
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="q1">
+  <h3>Q1: Which component stores object data (the actual bytes)?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">The filer's metadata database</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q1')">Volume servers, as blobs in append-only volume files</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">The master server's in-memory map</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">The S3 API server's local disk</button>
+  <div class="feedback" id="q1-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q1')">Check</button>
+</div>
+
+<div class="quiz" id="q2">
+  <h3>Q2: Why can the master server stay lightweight, even with billions of files?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">It uses a distributed in-memory cache across all nodes</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">It compresses metadata to 1 byte per file</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q2')">It only tracks volumes, not individual files — file metadata lives on volume servers</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">It offloads all work to the filer and just routes requests</button>
+  <div class="feedback" id="q2-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q2')">Check</button>
+</div>
+
+<h2>Trace It: PutObject and GetObject</h2>
+
+<p>Here is the full lifecycle of an S3 object, traced through every layer:</p>
+
+<h3>PutObject("photos", "sunset.jpg")</h3>
+<div class="trace-step">1. <strong>S3 API</strong>: Authenticate request (SigV4). Check IAM policy. Normalize object key.</div>
+<div class="trace-step">2. <strong>S3 API → Filer</strong>: Call <code>toFilerPath("photos", "sunset.jpg")</code> → <code>/buckets/photos/sunset.jpg</code>. Write the data to this filer path.</div>
+<div class="trace-step">3. <strong>Filer</strong>: Split the data into 4 MB chunks. For each chunk, request a new file ID from the master.</div>
+<div class="trace-step">4. <strong>Master</strong>: Pick a writable volume server. Return (volume_id, file_key, file_cookie, volume_server_url).</div>
+<div class="trace-step">5. <strong>Filer → Volume Server</strong>: Write each chunk's blob to its assigned volume server.</div>
+<div class="trace-step">6. <strong>Filer</strong>: Store the file entry in its metadata DB: name="sunset.jpg", size=..., chunks=[{vid, fid, offset, size}, ...], extended attributes (ETag, content-type, SSE info, etc.).</div>
+<div class="trace-step">7. <strong>S3 API</strong>: Return ETag and (if versioned) version-id to client.</div>
+
+<h3>GetObject("photos", "sunset.jpg")</h3>
+<div class="trace-step">1. <strong>S3 API</strong>: Authenticate. Look up filer entry at <code>/buckets/photos/sunset.jpg</code> — get the chunk list.</div>
+<div class="trace-step">2. <strong>S3 API → Volume Servers (directly!)</strong>: For each chunk reference, stream the blob bytes directly from the volume server. No filer in the data path.</div>
+<div class="trace-step">3. <strong>S3 API</strong>: Assemble the response, handle Range requests, apply SSE decryption, set response headers (ETag, Content-Type, etc.).</div>
+
+<h2>Primary Source</h2>
+
+<p>Read sections 3 (Architecture) and 4 (Design) of the <a href="http://www.usenix.org/event/osdi10/tech/full_papers/Beaver.pdf">Facebook Haystack paper</a>. Pay attention to how Haystack's "volume" concept eliminates the per-file metadata bottleneck — this is the single most important idea that SeaweedFS inherits.</p>
+
+<h2>Next</h2>
+
+<p>In the next lesson, we'll zoom into <strong>how bucket metadata flows from the S3 API through the filer to storage</strong>, and examine the BucketRegistry cache and the metadata subscription system.</p>
+
+<hr>
+<p><em>Stuck? Have a question about something in this lesson? Just ask — I'm here as your teacher. The <a href="glossary.html">glossary</a> and <a href="architecture.html">architecture reference</a> are also available for quick lookup.</em></p>
+
+<script>
+  function selectQuiz(btn, quizId) {
+    const quiz = document.getElementById(quizId);
+    quiz.querySelectorAll('.quiz-option').forEach(b => {
+      b.classList.remove('correct', 'wrong');
+    });
+    btn.classList.add('selected');
+  }
+
+  function checkQuiz(quizId) {
+    const quiz = document.getElementById(quizId);
+    const selected = quiz.querySelector('.selected');
+    const feedback = document.getElementById(quizId + '-feedback');
+
+    if (!selected) {
+      feedback.textContent = 'Select an answer first.';
+      feedback.className = 'feedback show wrong';
+      return;
+    }
+
+    if (selected.dataset.answer === 'correct') {
+      selected.classList.add('correct');
+      feedback.className = 'feedback show correct';
+      feedback.textContent = 'Correct! You\'re building the right mental model.';
+    } else {
+      selected.classList.add('wrong');
+      const correct = quiz.querySelector('[data-answer="correct"]');
+      correct.classList.add('correct');
+      feedback.className = 'feedback show wrong';
+      feedback.textContent = 'Not quite. The correct answer is highlighted in green. Review the section above and try again.';
+    }
+
+    const btn = quiz.querySelector('.check-btn');
+    btn.disabled = true;
+  }
+</script>
+
+</body>
+</html>

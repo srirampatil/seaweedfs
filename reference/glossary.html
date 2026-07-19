@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glossary &mdash; SeaweedFS Architecture</title>
+<link rel="stylesheet" href="../assets/shared.css">
+</head>
+<body>
+
+<h1>Glossary</h1>
+
+<p>A quick-reference glossary of terms used throughout the SeaweedFS architecture lessons. New terms are added as they appear.</p>
+
+<h2>Core Architecture</h2>
+
+<dl>
+  <dt>Master Server</dt>
+  <dd>The central coordinator. Stores volume-id &rarr; volume-server mappings (static, cacheable metadata). Generates monotonically-increasing <em>file keys</em> for write requests. Supports automatic failover with multiple masters — no single point of failure.</dd>
+
+  <dt>Volume Server</dt>
+  <dd>The data plane. Manages multiple <em>volumes</em> on disk. Stores blob metadata (16 bytes per blob) entirely in memory for O(1) lookups. Serves read/write requests directly from clients — the master is not in the data path.</dd>
+
+  <dt>Volume</dt>
+  <dd>A 32 GB (by default) append-only log file on a volume server. Contains many blobs stored sequentially. Volumes are the unit of replication, tiering, and garbage collection. Each has a unique 32-bit volume ID.</dd>
+
+  <dt>Needle / Blob</dt>
+  <dd>The atomic unit of storage. A needle is a key-value pair: a 64-bit file key, a 32-bit file cookie (for security), and the blob contents. Stored sequentially inside a volume.</dd>
+
+  <dt>FID (File ID)</dt>
+  <dd>A triple of <code>(volume_id, file_key, file_cookie)</code> that uniquely addresses any blob in the cluster. Rendered as <code>3,01637037d6</code> in the HTTP API.</dd>
+
+  <dt>Filer</dt>
+  <dd>A stateless, linearly-scalable server that adds a directory/file namespace on top of the flat blob store. Stores directory structure in a pluggable metadata store (MySQL, Postgres, Redis, LevelDB, etc.). File contents point to one or more <em>chunks</em> (blobs) on volume servers. Exposes HTTP, WebDAV, FUSE, and S3 interfaces.</dd>
+</dl>
+
+<h2>S3 API Concepts</h2>
+
+<dl>
+  <dt>S3 API Server</dt>
+  <dd>A stateless HTTP server that translates S3 REST calls (PutObject, GetObject, ListBuckets, etc.) into filer operations. Runs alongside or separately from the filer. Supports path-style and virtual-host-style bucket addressing.</dd>
+
+  <dt>BucketsPath</dt>
+  <dd>The filer directory prefix where all S3 buckets live. Default is <code>/buckets</code>. A bucket named <code>my-bucket</code> lives at <code>/buckets/my-bucket</code> on the filer. Objects within the bucket live as files under that directory.</dd>
+
+  <dt>bucketDir</dt>
+  <dd>The absolute filer path for a bucket: <code>bucketsPath/bucketName</code>. Defined in <code>weed/s3api/bucket_paths.go</code>. Used to construct object paths.</dd>
+
+  <dt>toFilerPath</dt>
+  <dd>The function that maps an S3 (bucket, object-key) pair to a filer path: <code>bucketsPath/bucket/normalizedObjectKey</code>. The object key is normalized first (e.g., removing redundant slashes).</dd>
+
+  <dt>BucketRegistry</dt>
+  <dd>An in-memory LRU cache (<code>weed/s3api/bucket_metadata.go</code>) that lazily loads bucket metadata from the filer. Uses <code>singleflight</code> to deduplicate concurrent loads. Avoids hitting the filer for every request.</dd>
+
+  <dt>BucketMetaData</dt>
+  <dd>The in-memory representation of a bucket: name, owner, ACL grants, object ownership setting, and whether it's a table bucket.</dd>
+
+  <dt>Collection</dt>
+  <dd>A storage namespace in the volume layer. Each bucket gets its own collection (mapping to a prefix on volume servers) so that data from different buckets can be placed on different volumes or tiers.</dd>
+</dl>
+
+<h2>Identity and Access</h2>
+
+<dl>
+  <dt>IdentityAccessManagement (IAM)</dt>
+  <dd>The subsystem (<code>weed/s3api/</code>) that handles AWS SigV4 authentication, credential verification, and action authorization. Supports credentials stored in filer, Postgres, or memory.</dd>
+
+  <dt>CredentialManager</dt>
+  <dd>Pluggable backend for storing S3 identities and their secret keys. Supports filer-based storage (filer_etc, the default), PostgreSQL, and in-memory.</dd>
+
+  <dt>IAMManager</dt>
+  <dd>The advanced IAM system (<code>weed/iam/integration/</code>) that adds OIDC federation, STS (temporary credentials), roles, and fine-grained policies. Configured via a JSON config file.</dd>
+
+  <dt>STS</dt>
+  <dd>Security Token Service. The S3 API server can issue temporary credentials via <code>AssumeRoleWithWebIdentity</code> (OIDC/JWT), <code>AssumeRole</code> (SigV4), and <code>GetCallerIdentity</code>.</dd>
+</dl>
+
+<h2>Data Flow</h2>
+
+<dl>
+  <dt>Chunk</dt>
+  <dd>A reference to a blob stored on a volume server, described by a file ID and byte range. Large S3 objects are split into multiple chunks by the filer. Each chunk points to a volume server + fid + offset + size.</dd>
+
+  <dt>ReaderCache</dt>
+  <dd>A shared, server-lifetime cache (<code>weed/filer/</code>) for in-flight and recently-completed chunk downloads. Multiple concurrent GET requests for the same object share a single download — the S3 API server uses this to stream directly from volume servers, bypassing the filer for data transfer.</dd>
+
+  <dt>Stream-from-volume-servers</dt>
+  <dd>The optimization where the S3 API server reads chunks directly from volume servers instead of proxying through the filer. Eliminates ~19ms of filer proxy overhead on GET requests.</dd>
+</dl>
+
+</body>
+</html>

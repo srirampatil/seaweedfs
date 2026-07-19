@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Architecture Reference &mdash; SeaweedFS S3 Object Store</title>
+<link rel="stylesheet" href="../assets/shared.css">
+</head>
+<body>
+
+<h1>SeaweedFS S3 Object Store Architecture</h1>
+
+<p>The quick-reference companion to the architecture lessons. Keep this open while working through the lessons.</p>
+
+<h2>The Four Layers</h2>
+
+<p>SeaweedFS's S3 object store is built from four distinct layers. Each layer has a clear responsibility, and layers communicate through well-defined interfaces.</p>
+
+<div class="arch-layer">Layer 4: S3 API Server (port 8333) — REST → filer protocol</div>
+<div class="arch-description">Translates S3 REST (PutObject, GetObject, CreateBucket, etc.) into filer directory/file operations. Handles SigV4 auth, IAM, bucket policies, CORS, versioning, SSE encryption, multipart uploads, lifecycle. Stateless — multiple instances can run behind a load balancer.</div>
+
+<div class="arch-layer">Layer 3: Filer — directory/file namespace → blob references</div>
+<div class="arch-description">Provides a hierarchical directory/file view on top of the flat blob store. Directories and file metadata (name, size, chunks, extended attributes) are stored in a pluggable metadata store (MySQL, Postgres, Redis, etc.). File contents are stored as references (chunks) to blobs on volume servers. The filer is stateless — all persistent state lives in the metadata store and volume servers.</div>
+
+<div class="arch-layer">Layer 2: Volume Servers — blob storage</div>
+<div class="arch-description">Store data in 32 GB append-only volume files. Each volume contains many blobs (needles) stored sequentially. A 16-byte in-memory index maps each blob's file key to its offset and size within the volume. Reads are O(1): one disk seek to the offset, one read of the size. Write an ID with metadata to your own DB, not SeaweedFS's. The filer handles this mapping for you when using the S3 API.</div>
+
+<div class="arch-layer">Layer 1: Master Server — cluster coordination</div>
+<div class="arch-description">Tracks which volume servers hold which volumes (volume-id → server mapping). Assigns new file keys for write requests. Supports automatic failover with multiple masters using Raft. The master is NOT in the data path — clients cache volume locations and talk directly to volume servers for reads and writes.</div>
+
+<h2>How a Bucket is Stored</h2>
+
+<ol>
+  <li>When <code>CreateBucket("photos")</code> is called, the S3 API server calls <code>mkdir("/buckets", "photos")</code> on the filer.</li>
+  <li>The filer creates a directory entry at <code>/buckets/photos</code> in its metadata store.</li>
+  <li>Bucket configuration (owner, versioning, object lock, ACL, lifecycle rules) is stored as <strong>extended attributes</strong> on the filer directory entry.</li>
+  <li>The S3 API server also creates a <strong>collection</strong> on the volume servers with a name derived from the bucket. This isolates the bucket's data from other buckets.</li>
+  <li>Bucket metadata is cached in the <a href="glossary.html#bucketregistry">BucketRegistry</a> (an in-memory LRU cache) to avoid repeated filer lookups.</li>
+</ol>
+
+<h2>How an Object is Stored and Retrieved</h2>
+
+<h3>PutObject</h3>
+
+<ol>
+  <li>S3 API receives <code>PUT /photos/sunset.jpg</code> with SigV4 credentials.</li>
+  <li>The IAM layer authenticates the request and checks bucket policy.</li>
+  <li>The S3 API constructs the filer path: <code>/buckets/photos/sunset.jpg</code> via <code>toFilerPath("photos", "sunset.jpg")</code>.</li>
+  <li>The object is written to the filer, which splits it into <strong>chunks</strong> (typically 4 MB each) and assigns each chunk a file ID on a volume server.</li>
+  <li>The filer entry for <code>sunset.jpg</code> stores: file name, total size, content type, ETag, and a list of chunks (each with volume_id + file_key + offset + size).</li>
+  <li>The S3 API returns the ETag and optional version-id to the client.</li>
+</ol>
+
+<h3>GetObject</h3>
+
+<ol>
+  <li>S3 API receives <code>GET /photos/sunset.jpg</code>.</li>
+  <li>The filer entry is looked up: <code>/buckets/photos/sunset.jpg</code> → list of chunk references.</li>
+  <li><strong>Key optimization</strong>: instead of proxying through the filer, the S3 API server streams chunks <strong>directly from volume servers</strong> using the <a href="glossary.html#readercache">ReaderCache</a>. This eliminates the filer as a data-path bottleneck.</li>
+  <li>SSE decryption (if applicable) happens inline during streaming.</li>
+</ol>
+
+<h2>How Users and IAM Work</h2>
+
+<ol>
+  <li><strong>Credentials</strong> (access key + secret key pairs) are stored in a pluggable <a href="glossary.html#credentialmanager">CredentialManager</a>. Default: stored on the filer under <code>/etc/iam/identities/</code>.</li>
+  <li><strong>Authentication</strong>: Every S3 request is authenticated via AWS SigV4 signature verification. Anonymous access is possible only when IAM is disabled.</li>
+  <li><strong>Authorization</strong>: After auth, the IAM layer checks whether the identity has permission for the requested action on the target resource. This can use:
+    <ul>
+      <li>Simple per-identity actions (read, write, admin, list, tagging)</li>
+      <li>Bucket policies (JSON-based, evaluated by the PolicyEngine)</li>
+      <li>Advanced IAM with roles, OIDC federation, and STS temporary credentials</li>
+    </ul>
+  </li>
+  <li><strong>Bucket Ownership</strong>: When a bucket is created, the creator's identity ID is stored as an extended attribute on the bucket's filer entry. Only the owner (or an admin) can delete the bucket.</li>
+</ol>
+
+<h2>Key Design Principles</h2>
+
+<table>
+  <tr><th>Principle</th><th>How SeaweedFS Achieves It</th></tr>
+  <tr>
+    <td>No central metadata bottleneck</td>
+    <td>Object metadata (file names, sizes, chunk lists) lives in the filer's metadata store, which is a horizontally-scalable external database. The master only tracks volumes, not objects.</td>
+  </tr>
+  <tr>
+    <td>O(1) data access</td>
+    <td>Blob metadata (16 bytes per blob) fits entirely in memory on volume servers. One lookup + one disk seek + one read per blob.</td>
+  </tr>
+  <tr>
+    <td>Separation of metadata and data paths</td>
+    <td>Metadata flows through the filer (what chunks exist, where they are). Data flows directly from volume servers to clients, bypassing the filer entirely.</td>
+  </tr>
+  <tr>
+    <td>Stateless API layer</td>
+    <td>The S3 API server holds no persistent state. It can be scaled horizontally. All state is in the filer's metadata store and on volume servers.</td>
+  </tr>
+  <tr>
+    <td>Append-only storage</td>
+    <td>Volumes are append-only logs. No in-place updates. Deletions are soft — they write a tombstone. Compaction reclaims space asynchronously. This is SSD-friendly and crash-safe.</td>
+  </tr>
+</table>
+
+</body>
+</html>

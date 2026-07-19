@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 4: Multipart Upload Lifecycle</title>
+<link rel="stylesheet" href="../assets/shared.css">
+<style>
+  .quiz { margin: 2rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+  .quiz h3 { margin-top: 0; }
+  .quiz-option { display: block; padding: 0.4rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 3px; border: 1px solid var(--border); background: var(--bg); font-family: inherit; font-size: 0.95em; color: var(--text); transition: background 0.15s; }
+  .quiz-option:hover { background: var(--accent-light); }
+  .quiz-option.correct { background: #c8e6c9; border-color: #66bb6a; }
+  .quiz-option.wrong { background: #ffcdd2; border-color: #ef5350; }
+  .feedback { margin-top: 0.5rem; padding: 0.5rem; border-radius: 3px; font-size: 0.9em; display: none; }
+  .feedback.show { display: block; }
+  .feedback.correct { background: #c8e6c9; }
+  .feedback.wrong { background: #ffcdd2; }
+  .check-btn { padding: 0.4rem 1.2rem; margin-top: 0.5rem; border: none; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; font-family: inherit; font-size: 0.9em; }
+  .check-btn:hover { opacity: 0.9; }
+  .check-btn:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+
+<h1>Lesson 4: Multipart Upload Lifecycle</h1>
+
+<p>S3 multipart upload uploads large objects in parts, assembled at the end into a single object. This lesson traces each phase through the code.</p>
+
+<h2>The Five Phases</h2>
+
+<div class="arch-layer">1. Initiate — CreateMultipartUpload</div>
+<div class="arch-description">Creates a unique upload ID bound to the object key. Creates a staging directory <code>/buckets/&lt;b&gt;/.uploads/&lt;id&gt;/</code>. No data uploaded yet.</div>
+
+<div class="arch-layer">2. Upload — UploadPart (once per part)</div>
+<div class="arch-description">Each part uploaded independently using the chunked pipeline from Lesson 3. Parts can arrive in any order.</div>
+
+<div class="arch-layer">3. Complete — CompleteMultipartUpload</div>
+<div class="arch-description">Validates ETags, concatenates chunk references with new offsets, writes final object, cleans up staging directory.</div>
+
+<div class="arch-layer">4. Abort (optional) — AbortMultipartUpload</div>
+<div class="arch-description">Deletes the staging directory and all parts.</div>
+
+<div class="arch-layer">5. Lifecycle (background)</div>
+<div class="arch-description">Expired uploads are auto-aborted by the lifecycle subsystem.</div>
+
+<h2>Phase 1: Initiate</h2>
+
+<p><code>createMultipartUpload</code> (<code>filer_multipart.go:61</code>) generates the upload ID:</p>
+
+<pre><code>uploadId := SHA1(objectKey) + "_" + UUID</code></pre>
+
+<p>The SHA-1 prefix <strong>cryptographically binds</strong> the upload to the object key. <code>checkUploadId</code> verifies this at every subsequent call — you cannot upload parts for one key and complete as another.</p>
+
+<p>A staging directory is created at <code>/buckets/&lt;bucket&gt;/.uploads/&lt;uploadID&gt;/</code>. Its extended attributes store: the object key, user metadata, content type, SSE encryption config, checksum algorithm, object lock metadata.</p>
+
+<h2>Phase 2: UploadPart</h2>
+
+<p><code>PutObjectPartHandler</code> (<code>s3api_object_handlers_multipart.go:330</code>) handles each part:</p>
+
+<pre><code>filePath = "/buckets/my-bucket/.uploads/SHA_UUID/0003_UUID.part"</code></pre>
+
+<p>The filename format is <code>NNNN_UUID.part</code> — zero-padded part number for sorted listing + random UUID so re-uploading the same part number creates a new file.</p>
+
+<p>Upload uses the exact same <code>putToFiler</code> pipeline as PutObject (8 MB chunks, parallel upload, direct to volume servers). Key differences from PutObject:</p>
+
+<ul>
+  <li><strong>Parts are independent</strong> — part 7 can upload before part 1.</li>
+  <li><strong>Re-uploads</strong>: same part number → new <code>.part</code> file. At completion, if duplicates exist, <strong>newest wins</strong> (by chunk <code>ModifiedTsNs</code>).</li>
+  <li><strong>SSE encryption inherited</strong> from the upload directory entry — client doesn't re-send SSE headers per part.</li>
+  <li><strong>Lifecycle TTL suppressed</strong> — parts get <code>lifecycleTTLSec=0</code>. The clock starts at completion, not upload.</li>
+  <li><strong>5 MB minimum</strong> per part (except last), validated at completion.</li>
+</ul>
+
+<h2>Phase 3: CompleteMultipartUpload</h2>
+
+<p><code>completeMultipartUpload</code> (<code>filer_multipart.go:574</code>) has five steps:</p>
+
+<h3>Step 1: Validate the part list</h3>
+
+<p>The client submits <code>{PartNumber, ETag}</code> pairs. The server checks parts are in ascending order with valid ETags. Re-ordered parts → <code>ErrInvalidPartOrder</code>.</p>
+
+<h3>Step 2: Match parts to stored files</h3>
+
+<p>Lists the staging directory, finds all <code>.part</code> files. For each part number: validates ETag, picks newest entry if duplicates exist, verifies size ≥ 5 MB (except last). Unmatched entries go to the delete list.</p>
+
+<h3>Step 3: Assemble chunks</h3>
+
+<p><strong>No data is copied.</strong> Chunk references from each part are concatenated with recomputed offsets:</p>
+
+<pre><code>offset = 0
+for part in ordered_parts:
+    for chunk in part.chunks:
+        finalChunk = { ...chunk..., Offset: offset }
+        offset += chunk.Size</code></pre>
+
+<h3>Step 4: Write the final object</h3>
+
+<table>
+  <tr><th>Versioning state</th><th>Behavior</th></tr>
+  <tr><td>Enabled</td><td>Version file in <code>.versions/</code> with real version ID. Latest-version pointer updated.</td></tr>
+  <tr><td>Suspended</td><td>Object written at path with <code>versionId="null"</code>. Existing null-version replaced.</td></tr>
+  <tr><td>None</td><td>Object written directly at path.</td></tr>
+</table>
+
+<p>Extended attributes inherit from the upload directory (metadata, content type, object lock, checksum). SSE metadata is copied from the first part. The multipart ETag is stored.</p>
+
+<h3>Step 5: Clean up</h3>
+
+<p>Stale/duplicate part entries are deleted. The upload directory is removed. Completion is <strong>idempotent</strong> — if the object already exists with the same upload ID, the call returns the existing result (handles network retries).</p>
+
+<h3>The Multipart ETag</h3>
+
+<p>Unlike PutObject's content-MD5 ETag, the multipart ETag is the MD5 of <strong>concatenated per-part ETags</strong> + part count:</p>
+
+<pre><code>ETag = MD5(etag1_raw || etag2_raw || ... || etagN_raw) + "-" + str(N)</code></pre>
+
+<p>For example: <code>"d41d8cd98f00b204e9800998ecf8427e-3"</code>. This matches AWS S3 behavior.</p>
+
+<h2>Phase 4: Abort</h2>
+
+<p><code>abortMultipartUpload</code> (<code>filer_multipart.go:937</code>) recursively deletes the upload directory. All <code>.part</code> files are gone. The volume server blobs become orphans, eventually reclaimed by volume compaction.</p>
+
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="q1">
+  <h3>Q1: Why is the upload ID bound to the object key via SHA-1?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">To ensure chronological ordering of upload requests</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">To deduplicate part uploads by hashing into the filename</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q1')">To prevent uploading parts for one key and completing as another key</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">To shard uploads across multiple volume servers</button>
+  <div class="feedback" id="q1-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q1')">Check</button>
+</div>
+
+<div class="quiz" id="q2">
+  <h3>Q2: What happens to chunk data during CompleteMultipartUpload?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">All chunks are re-uploaded to a single contiguous volume server range</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q2')">Chunk references are concatenated with new offsets — no blob data is copied</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">Chunks are merged into one blob on the master server</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">Each part is re-read and re-encrypted with the final object key</button>
+  <div class="feedback" id="q2-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q2')">Check</button>
+</div>
+
+<div class="quiz" id="q3">
+  <h3>Q3: How is the multipart ETag calculated?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">MD5 of the entire assembled object content</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q3')">MD5 of concatenated per-part ETags, suffixed with "-N"</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">SHA-256 of the first part only</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">Raw concatenation of all part ETags without hashing</button>
+  <div class="feedback" id="q3-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q3')">Check</button>
+</div>
+
+<h2>Primary Source</h2>
+<ol>
+  <li><code>weed/s3api/filer_multipart.go:61</code> — <code>createMultipartUpload</code></li>
+  <li><code>weed/s3api/s3api_object_handlers_multipart.go:330</code> — <code>PutObjectPartHandler</code></li>
+  <li><code>weed/s3api/filer_multipart.go:574</code> — <code>completeMultipartUpload</code></li>
+  <li><code>weed/s3api/filer_multipart.go:937</code> — <code>abortMultipartUpload</code></li>
+  <li><code>weed/s3api/s3api_object_handlers_multipart.go:514</code> — upload ID generation</li>
+  <li><code>weed/s3api/filer_multipart.go:1295</code> — <code>calculateMultipartETag</code></li>
+</ol>
+
+<hr>
+<p><em>Questions? Ask. The <a href="../reference/glossary.html">glossary</a> and <a href="../reference/architecture.html">architecture reference</a> are always available.</em></p>
+
+<script>
+  function selectQuiz(btn, quizId) {
+    const quiz = document.getElementById(quizId);
+    quiz.querySelectorAll('.quiz-option').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+  }
+  function checkQuiz(quizId) {
+    const quiz = document.getElementById(quizId);
+    const selected = quiz.querySelector('.selected');
+    const feedback = document.getElementById(quizId + '-feedback');
+    if (!selected) { feedback.textContent='Select an answer first.'; feedback.className='feedback show wrong'; return; }
+    if (selected.dataset.answer==='correct') { selected.classList.add('correct'); feedback.className='feedback show correct'; feedback.textContent='Correct!'; }
+    else { selected.classList.add('wrong'); quiz.querySelector('[data-answer="correct"]').classList.add('correct'); feedback.className='feedback show wrong'; feedback.textContent='Not quite.'; }
+    quiz.querySelector('.check-btn').disabled=true;
+  }
+</script>
+
+</body>
+</html>

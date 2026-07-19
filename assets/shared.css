@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SeaweedFS Object Store Architecture</title>
+<style>
+  :root {
+    --bg: #fafaf8;
+    --text: #1a1a1a;
+    --muted: #666;
+    --accent: #2e7d32;
+    --accent-light: #e8f5e9;
+    --border: #e0e0d8;
+    --code-bg: #f4f4f0;
+    --warning: #f9a825;
+    --warning-bg: #fff8e1;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a18;
+      --text: #e8e8e0;
+      --muted: #999;
+      --accent: #66bb6a;
+      --accent-light: #1b3a1b;
+      --border: #333328;
+      --code-bg: #252520;
+      --warning: #ffca28;
+      --warning-bg: #332d00;
+    }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: "Georgia", "Times New Roman", serif;
+    font-size: 17px;
+    line-height: 1.65;
+    color: var(--text);
+    background: var(--bg);
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem;
+  }
+
+  h1 {
+    font-size: 2rem;
+    font-weight: normal;
+    margin-bottom: 0.5rem;
+    letter-spacing: -0.01em;
+  }
+
+  h2 {
+    font-size: 1.35rem;
+    font-weight: normal;
+    margin: 2.5rem 0 0.75rem;
+    padding-bottom: 0.3rem;
+    border-bottom: 1px solid var(--border);
+    letter-spacing: -0.01em;
+  }
+
+  h3 {
+    font-size: 1.1rem;
+    font-weight: normal;
+    margin: 1.5rem 0 0.5rem;
+  }
+
+  p { margin: 0.75rem 0; }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  code {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+  }
+
+  pre {
+    background: var(--code-bg);
+    padding: 1rem 1.2rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 1rem 0;
+    font-size: 0.85em;
+    line-height: 1.5;
+    border: 1px solid var(--border);
+  }
+
+  pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+  }
+
+  .note, .warning {
+    padding: 0.8rem 1rem;
+    margin: 1rem 0;
+    border-radius: 4px;
+    font-size: 0.92em;
+  }
+
+  .note {
+    background: var(--accent-light);
+    border-left: 3px solid var(--accent);
+  }
+
+  .warning {
+    background: var(--warning-bg);
+    border-left: 3px solid var(--warning);
+  }
+
+  .footnotes {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.85em;
+    color: var(--muted);
+  }
+
+  .footnotes ol { padding-left: 1.5rem; }
+  .footnotes li { margin: 0.3rem 0; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.92em;
+  }
+
+  th, td {
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+
+  th {
+    font-weight: normal;
+    color: var(--muted);
+    border-bottom: 2px solid var(--border);
+  }
+
+  .arch-layer {
+    display: block;
+    padding: 0.6rem 1rem;
+    margin: 0.3rem 0;
+    border-radius: 4px;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.88em;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-light);
+  }
+
+  .arch-layer + .arch-description {
+    margin-top: 0;
+    margin-bottom: 1.2rem;
+    padding-left: 1rem;
+    border-left: 4px solid transparent;
+    color: var(--muted);
+    font-size: 0.92em;
+  }
+
+  @media print {
+    body { font-size: 12pt; max-width: none; padding: 1cm; }
+    .note, .warning { break-inside: avoid; }
+  }
+</style>
+</head>
+<body></body>
+</html>

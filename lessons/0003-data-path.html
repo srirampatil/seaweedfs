@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 3: The Data Path &mdash; Chunks, Blobs, and Direct Streaming</title>
+<link rel="stylesheet" href="../assets/shared.css">
+<style>
+  .quiz { margin: 2rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+  .quiz h3 { margin-top: 0; }
+  .quiz-option { display: block; padding: 0.4rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 3px; border: 1px solid var(--border); background: var(--bg); font-family: inherit; font-size: 0.95em; color: var(--text); transition: background 0.15s; }
+  .quiz-option:hover { background: var(--accent-light); }
+  .quiz-option.correct { background: #c8e6c9; border-color: #66bb6a; }
+  .quiz-option.wrong { background: #ffcdd2; border-color: #ef5350; }
+  .feedback { margin-top: 0.5rem; padding: 0.5rem; border-radius: 3px; font-size: 0.9em; display: none; }
+  .feedback.show { display: block; }
+  .feedback.correct { background: #c8e6c9; }
+  .feedback.wrong { background: #ffcdd2; }
+  .check-btn { padding: 0.4rem 1.2rem; margin-top: 0.5rem; border: none; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; font-family: inherit; font-size: 0.9em; }
+  .check-btn:hover { opacity: 0.9; }
+  .check-btn:disabled { opacity: 0.5; cursor: default; }
+  .data-flow { margin: 1.5rem 0; font-size: 0.9em; }
+  .data-flow .node { display: inline-block; padding: 0.3rem 0.7rem; border: 2px solid var(--accent); border-radius: 4px; margin: 0.2rem; font-weight: bold; }
+  .data-flow .arrow { color: var(--muted); margin: 0 0.3rem; font-size: 1.2em; }
+  .data-flow .metadata { border-style: dashed; border-color: var(--muted); }
+  .data-flow .data { border-style: solid; }
+</style>
+</head>
+<body>
+
+<h1>Lesson 3: The Data Path — Chunks, Blobs, and Direct Streaming</h1>
+
+<p>Lessons 1 and 2 covered the <em>metadata</em> — how bucket configs and IAM flow through the system, kept consistent by push-based subscriptions. This lesson covers the <em>data</em>: what actually happens to the bytes when you <code>PutObject</code> and <code>GetObject</code>.</p>
+
+<h2>The Core Data Structures</h2>
+
+<h3>FileChunk: A Pointer to a Blob</h3>
+
+<p>A <code>FileChunk</code> (<code>filer.pb.go:894</code>) is SeaweedFS's fundamental data reference. It's not the data itself — it's a <strong>pointer</strong> that says "the bytes at offset N through offset N+M in this file live at this volume server, at this file ID, at this byte range":</p>
+
+<pre><code>type FileChunk struct {
+    Fid         *FileId     // (volume_id, file_key, cookie) — where the blob lives
+    Offset      int64       // byte offset within the logical file
+    Size        uint64      // size of this chunk's contribution
+    SseType     SSEType     // encryption type (NONE, SSE_C, SSE_KMS, SSE_S3)
+    SseMetadata []byte      // per-chunk encryption metadata
+    IsChunkManifest bool    // true if this chunk's content is itself a list of FileChunks
+    CipherKey   []byte      // optional server-side encryption key
+}
+
+type FileId struct {
+    VolumeId uint32   // which 32GB volume
+    FileKey  uint64   // unique key within that volume
+    Cookie   uint32   // security cookie (prevents URL guessing)
+}</code></pre>
+
+<div class="note">
+<strong>Key insight:</strong> <code>Offset</code> is the position within the <em>logical file</em>, not within the volume. A 100 MB object split into 25 chunks of 4 MB each would have chunk offsets 0, 4MB, 8MB, etc. — regardless of where each chunk lands on its volume server.
+</div>
+
+<h3>Filer Entry: The Full Object Metadata</h3>
+
+<p>A filer <code>Entry</code> for an S3 object contains everything needed to reconstruct the file:</p>
+
+<ul>
+  <li><strong>Chunks</strong> (<code>[]*FileChunk</code>) — the list of blob pointers</li>
+  <li><strong>Attributes</strong> (<code>FuseAttributes</code>) — size, MIME type, MD5, timestamps, TTL</li>
+  <li><strong>Extended</strong> (<code>map[string][]byte</code>) — ETag, version ID, SSE metadata, user metadata, tags, storage class, object lock info</li>
+  <li><strong>Content</strong> (<code>[]byte</code>) — for tiny files (≤ 256 KB), the data is stored inline in the entry itself</li>
+</ul>
+
+<h2>PutObject: From HTTP Bytes to Volume Blobs</h2>
+
+<p>Here is the complete PutObject data path, traced through <code>putToFiler</code> (<code>s3api_object_handlers_put.go:373</code>):</p>
+
+<div class="data-flow">
+  <span class="node data">HTTP Body</span>
+  <span class="arrow">→</span>
+  <span class="node">SSE Encrypt</span>
+  <span class="arrow">→</span>
+  <span class="node">8 MB Chunker</span>
+  <span class="arrow">→</span>
+  <span class="node">Parallel Upload</span>
+  <span class="arrow">→</span>
+  <span class="node data">Volume Servers</span>
+  <span class="arrow">→</span>
+  <span class="node metadata">Filer Entry</span>
+</div>
+
+<h3>Step 1: SSE Encryption (If Requested)</h3>
+
+<p>Before chunking, the data stream is wrapped in an encryption layer (SSE-C, SSE-KMS, or SSE-S3). The encrypted stream is what gets chunked and uploaded — the volume servers never see plaintext.</p>
+
+<h3>Step 2: Auto-Chunking</h3>
+
+<p><code>operation.UploadReaderInChunks</code> (<code>operation/upload_chunked.go:59</code>) reads from the encrypted stream in <strong>8 MB chunks</strong>:</p>
+
+<pre><code>const chunkSize = 8 * 1024 * 1024  // 8 MB
+const smallFileLimit = 256 * 1024  // 256 KB stored inline</code></pre>
+
+<p>Chunks are processed in parallel — up to 4 concurrent uploads. Each chunk independently goes through the assign→upload pipeline.</p>
+
+<h3>Step 3: Volume Assignment</h3>
+
+<p>For each chunk, the <code>assignFunc</code> calls <code>filer.AssignVolume</code> via gRPC, which delegates to the <strong>master server</strong>. The master:</p>
+
+<ol>
+  <li>Picks a volume server with a writable volume in the correct collection (derived from the bucket name).</li>
+  <li>Generates a new <code>(volume_id, file_key, cookie)</code> — the file ID.</li>
+  <li>Returns the file ID and the volume server's URL.</li>
+</ol>
+
+<p>This is the <strong>only</strong> master involvement in the entire data path. Once assigned, the chunk upload is direct to the volume server.</p>
+
+<h3>Step 4: Parallel Upload to Volume Servers</h3>
+
+<p>Each chunk is uploaded directly to its assigned volume server via HTTP. The volume server:</p>
+
+<ol>
+  <li>Appends the blob to its append-only volume file.</li>
+  <li>Records the (file_key → offset, size) mapping in its in-memory index.</li>
+  <li>Returns success.</li>
+</ol>
+
+<p>The <code>UploadReaderInChunks</code> result includes a list of <code>FileChunk</code> entries — one per uploaded segment — with each chunk's file ID, offset, and size.</p>
+
+<h3>Step 5: Create the Filer Entry</h3>
+
+<p>Once all chunks are uploaded, the S3 API server assembles a <code>filer_pb.Entry</code> and calls <code>CreateEntry</code> on the filer:</p>
+
+<pre><code>entry := &filer_pb.Entry{
+    Name:        "sunset.jpg",
+    IsDirectory: false,
+    Attributes: &filer_pb.FuseAttributes{
+        FileSize: chunkResult.TotalSize,
+        Mime:     "image/jpeg",
+        Md5:      md5Sum,
+        Crtime:   now.Unix(),
+    },
+    Chunks:   chunkResult.FileChunks,  // [FileChunk, FileChunk, ...]
+    Extended: map[string][]byte{
+        "etag":         []byte(etag),
+        "x-amz-meta-*": ...,           // user metadata
+    },
+}</code></pre>
+
+<p>The filer stores this entry in its metadata DB (Postgres, Redis, LevelDB, etc.). The actual blob data never passes through the filer — it went directly from the S3 API server to the volume servers.</p>
+
+<div class="note">
+<strong>One exception:</strong> files smaller than 256 KB bypass the chunking pipeline entirely. Their content is stored inline in <code>entry.Content</code>, and the filer entry itself carries the bytes. This avoids volume-server round-trips for tiny objects.
+</div>
+
+<h2>GetObject: Streaming Directly from Volume Servers</h2>
+
+<p>The read path is where SeaweedFS's architecture really shines. <code>streamFromVolumeServers</code> (<code>s3api_object_handlers.go:935</code>) eliminates the filer from the data path entirely:</p>
+
+<div class="data-flow">
+  <span class="node metadata">Filer (entry lookup)</span>
+  <span class="arrow">→</span>
+  <span class="node">Chunk Resolution</span>
+  <span class="arrow">→</span>
+  <span class="node">ReaderCache</span>
+  <span class="arrow">→</span>
+  <span class="node data">Volume Servers (direct)</span>
+  <span class="arrow">→</span>
+  <span class="node">SSE Decrypt</span>
+  <span class="arrow">→</span>
+  <span class="node data">HTTP Response</span>
+</div>
+
+<h3>Step 1: Look Up the Filer Entry</h3>
+
+<p>The S3 API server fetches the object's filer entry — getting the list of <code>FileChunk</code> references. This is a metadata-only operation: a single gRPC call to the filer's metadata store. No data is transferred yet.</p>
+
+<h3>Step 2: Resolve Chunks to Visible Intervals</h3>
+
+<p>The chunk list might contain <strong>chunk manifests</strong> — chunks whose content is itself a list of sub-chunks (used for very large files). <code>NonOverlappingVisibleIntervals</code> recursively resolves these into a flat list of (offset, size, file-id) intervals covering the requested byte range.</p>
+
+<p>The volume server URLs are resolved via the <code>FilerClient</code>'s <code>vidMap</code> cache — a cached mapping of volume IDs to volume server URLs. No gRPC call to the filer per chunk.</p>
+
+<h3>Step 3: Stream Through the ReaderCache</h3>
+
+<p>This is the optimization that makes SeaweedFS fast for concurrent reads. The <code>ReaderCache</code> (<code>filer.NewReaderCache</code>, created at server startup in <code>s3api_server.go:284</code>) is a <strong>shared, server-lifetime cache</strong> for in-flight and recently-completed chunk downloads.</p>
+
+<p>How it works:</p>
+
+<ol>
+  <li>A <code>ChunkReaderAt</code> is created, backed by the shared ReaderCache.</li>
+  <li>When one request starts downloading chunk N from volume server X, the ReaderCache registers an in-flight download.</li>
+  <li>If a second concurrent request also needs chunk N, it <strong>shares the same in-flight download</strong> — no duplicate network call.</li>
+  <li>Completed chunks are cached in memory (configurable size, default 256 concurrent download slots).</li>
+</ol>
+
+<p>The stream flows directly: <strong>volume server → ReaderCache buffer → HTTP response writer</strong>. The filer is not in the data path at all. This eliminates ~19ms of filer proxy overhead compared to the old path where data flowed through the filer.</p>
+
+<h3>Step 4: SSE Decryption (If Encrypted)</h3>
+
+<p>For encrypted objects, decryption happens inline during streaming. The S3 API server:</p>
+
+<ol>
+  <li>Extracts the encryption key from the filer entry's extended attributes.</li>
+  <li>Creates a decryption wrapper around the chunk reader (AES-256-GCM for SSE-C, key unwrapping for SSE-KMS).</li>
+  <li>Streams decrypted bytes to the HTTP response.</li>
+</ol>
+
+<p>For range requests on encrypted objects, only the needed chunks are fetched and decrypted — not the entire object.</p>
+
+<h2>Chunk Manifests: Scaling to Very Large Files</h2>
+
+<p>A single object can span thousands of chunks (e.g., a 100 GB object = 12,500 chunks at 8 MB each). Storing all 12,500 chunk references directly in one filer entry would be unwieldy. Instead, SeaweedFS uses <strong>chunk manifests</strong>:</p>
+
+<ol>
+  <li>The filer entry stores only the top-level chunks (say, one per 1 GB).</li>
+  <li>Each top-level chunk has <code>IsChunkManifest: true</code>, meaning its blob content is a serialized list of sub-chunks.</li>
+  <li>On read, <code>NonOverlappingVisibleIntervals</code> recursively resolves manifests to find the actual data chunks for the requested range.</li>
+</ol>
+
+<p>This is transparent to the S3 API — it just sees a flat list of chunks after resolution.</p>
+
+<h2>Summary: Where Data and Metadata Diverge</h2>
+
+<table>
+  <tr><th>Path</th><th>Flows Through</th><th>Bottleneck?</th></tr>
+  <tr>
+    <td><strong>Metadata</strong> (names, sizes, bucket config, IAM)</td>
+    <td>S3 API → filer metadata store (Postgres/Redis/etc.)</td>
+    <td>No — metadata store is horizontally scalable</td>
+  </tr>
+  <tr>
+    <td><strong>Data</strong> (object bytes)</td>
+    <td>Client → S3 API → volume servers (direct HTTP)</td>
+    <td>No — volume servers are horizontally scalable, O(1) reads</td>
+  </tr>
+  <tr>
+    <td><strong>File ID assignment</strong></td>
+    <td>S3 API → filer → master (one call per chunk)</td>
+    <td>Lightweight — master only assigns IDs, doesn't touch data</td>
+  </tr>
+</table>
+
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="q1">
+  <h3>Q1: A 50 MB PutObject generates how many chunks (at 8 MB chunk size)?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">Exactly 6 chunks, each exactly 8 MB</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q1')">7 chunks: six 8 MB chunks plus one 2 MB chunk</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">1 chunk, because the S3 API sends the entire body to one volume server</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">50 chunks of 1 MB each</button>
+  <div class="feedback" id="q1-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q1')">Check</button>
+</div>
+
+<div class="quiz" id="q2">
+  <h3>Q2: What does a FileChunk's Offset field represent?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">The byte offset within the volume server's 32 GB volume file</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q2')">The byte offset within the logical file — the chunk's position in the reassembled object</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">The storage tier priority (cooler data has lower offsets)</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">The timestamp when the chunk was written</button>
+  <div class="feedback" id="q2-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q2')">Check</button>
+</div>
+
+<div class="quiz" id="q3">
+  <h3>Q3: During a GetObject, does data pass through the filer?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">Yes — the filer proxies all reads as a caching layer</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q3')">No — the filer only provides chunk references; data streams directly from volume servers to the S3 API</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">Yes for small objects, no for large objects</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">It depends on whether the ReaderCache has a warm entry</button>
+  <div class="feedback" id="q3-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q3')">Check</button>
+</div>
+
+<h2>Primary Source</h2>
+
+<p>Trace the code yourself in this order:</p>
+<ol>
+  <li><code>weed/s3api/s3api_object_handlers_put.go:373</code> — <code>putToFiler</code>: the complete PUT pipeline</li>
+  <li><code>weed/operation/upload_chunked.go:59</code> — <code>UploadReaderInChunks</code>: parallel chunked upload with volume assignment</li>
+  <li><code>weed/s3api/s3api_object_handlers.go:935</code> — <code>streamFromVolumeServers</code>: direct streaming from volume servers</li>
+  <li><code>weed/pb/filer_pb/filer.pb.go:894</code> — <code>FileChunk</code> and <code>FileId</code> protobuf definitions</li>
+</ol>
+
+<h2>Next</h2>
+
+<p>At this point you understand the complete picture: how configuration metadata and object data flow through the four layers. Future lessons can zoom into specific features: versioning internals, multipart upload lifecycle, SSE encryption key management, or the Iceberg/S3 Tables catalog.</p>
+
+<hr>
+<p><em>Questions? Ask. The <a href="../reference/glossary.html">glossary</a> and <a href="../reference/architecture.html">architecture reference</a> are always available.</em></p>
+
+<script>
+  function selectQuiz(btn, quizId) {
+    const quiz = document.getElementById(quizId);
+    quiz.querySelectorAll('.quiz-option').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+  }
+  function checkQuiz(quizId) {
+    const quiz = document.getElementById(quizId);
+    const selected = quiz.querySelector('.selected');
+    const feedback = document.getElementById(quizId + '-feedback');
+    if (!selected) {
+      feedback.textContent = 'Select an answer first.';
+      feedback.className = 'feedback show wrong';
+      return;
+    }
+    if (selected.dataset.answer === 'correct') {
+      selected.classList.add('correct');
+      feedback.className = 'feedback show correct';
+      feedback.textContent = 'Correct!';
+    } else {
+      selected.classList.add('wrong');
+      quiz.querySelector('[data-answer="correct"]').classList.add('correct');
+      feedback.className = 'feedback show wrong';
+      feedback.textContent = 'Not quite. The correct answer is highlighted in green.';
+    }
+    quiz.querySelector('.check-btn').disabled = true;
+  }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 2: Metadata Flow &mdash; Buckets, Users, and the Subscription Engine</title>
+<link rel="stylesheet" href="../assets/shared.css">
+<style>
+  .quiz { margin: 2rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+  .quiz h3 { margin-top: 0; }
+  .quiz-option { display: block; padding: 0.4rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 3px; border: 1px solid var(--border); background: var(--bg); font-family: inherit; font-size: 0.95em; color: var(--text); transition: background 0.15s; }
+  .quiz-option:hover { background: var(--accent-light); }
+  .quiz-option.correct { background: #c8e6c9; border-color: #66bb6a; }
+  .quiz-option.wrong { background: #ffcdd2; border-color: #ef5350; }
+  .feedback { margin-top: 0.5rem; padding: 0.5rem; border-radius: 3px; font-size: 0.9em; display: none; }
+  .feedback.show { display: block; }
+  .feedback.correct { background: #c8e6c9; }
+  .feedback.wrong { background: #ffcdd2; }
+  .check-btn { padding: 0.4rem 1.2rem; margin-top: 0.5rem; border: none; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; font-family: inherit; font-size: 0.9em; }
+  .check-btn:hover { opacity: 0.9; }
+  .check-btn:disabled { opacity: 0.5; cursor: default; }
+  .flow-diagram { margin: 1.5rem 0; font-family: "SF Mono", monospace; font-size: 0.85em; line-height: 1.6; }
+  .flow-box { display: inline-block; padding: 0.2rem 0.5rem; border: 1px solid var(--accent); border-radius: 3px; margin: 0 0.15rem; }
+  .flow-arrow { color: var(--muted); margin: 0 0.3rem; }
+</style>
+</head>
+<body>
+
+<h1>Lesson 2: Metadata Flow — Buckets, Users, and the Subscription Engine</h1>
+
+<p>In Lesson 1 we learned that the filer stores object <em>metadata</em> (names, sizes, chunk references) and volume servers store object <em>data</em> (bytes). But there's another category of metadata: <strong>configuration metadata</strong> — bucket settings, IAM credentials, policies. This lesson traces how that configuration metadata flows from the filer into the S3 API server's memory and stays consistent across the cluster.</p>
+
+<h2>Two Categories of Configuration Metadata</h2>
+
+<table>
+  <tr><th>Category</th><th>Examples</th><th>Filer Location</th></tr>
+  <tr>
+    <td>Bucket config</td>
+    <td>Versioning, Object Lock, ACL, ownership, lifecycle rules, encryption, tags, CORS, bucket policy</td>
+    <td>Extended attributes on <code>/buckets/&lt;name&gt;</code> directory entry</td>
+  </tr>
+  <tr>
+    <td>IAM config</td>
+    <td>User identities (access keys, secrets), named policies, groups, service accounts, OIDC providers</td>
+    <td><code>/etc/iam/identities/</code>, <code>/etc/iam/policies/</code>, <code>/etc/iam/groups/</code>, etc.</td>
+  </tr>
+</table>
+
+<h2>Part 1: The Bucket Config Flow</h2>
+
+<p>Every S3 request that touches a bucket (PutObject, GetObject, HeadBucket, etc.) needs to know things about that bucket. Is versioning enabled? Is Object Lock active? Who owns it? Rather than hitting the filer for every request, the S3 API server maintains an in-memory <strong>BucketConfigCache</strong>.</p>
+
+<h3>The BucketConfig Structure</h3>
+
+<p>The <code>BucketConfig</code> struct (<code>s3api_bucket_config.go:33</code>) is the in-memory representation of everything the S3 API server needs to know about a bucket:</p>
+
+<pre><code>type BucketConfig struct {
+    Name             string
+    Versioning       string   // "Enabled", "Suspended", or "" (never configured)
+    Ownership        string
+    ACL              []byte
+    Owner            string
+    IdentityId       string   // identity that created the bucket
+    IsPublicRead     bool     // cached flag, avoids JSON parsing on every request
+    CORS             *cors.CORSConfiguration
+    ObjectLockConfig *ObjectLockConfiguration
+    BucketPolicy     *policy_engine.PolicyDocument
+    LifecycleXML     []byte
+    LifecycleTTL     *LifecycleTTLResolver
+    Tags             map[string]string
+    Encryption       *s3_pb.EncryptionConfiguration
+    LastModified     time.Time
+}</code></pre>
+
+<div class="note">
+<strong>Key design decision:</strong> BucketConfig is derived from the bucket's filer entry, but it doesn't store a reference to the entry itself. This keeps cached configs small and avoids stale-entry bugs. The write path re-reads the entry from the filer.
+</div>
+
+<h3>Three Paths Into The Cache</h3>
+
+<p>The <code>BucketConfigCache</code> (<code>s3api_bucket_config.go:206</code>) is a dual LRU cache: one LRU for positive entries (known buckets), one for negative entries (confirmed-nonexistent buckets). Both are size-capped so a server serving millions of buckets only keeps its hot working set.</p>
+
+<p>There are <strong>three distinct paths</strong> that populate or update the cache:</p>
+
+<h4>Path 1: Lazy-Load on First Access</h4>
+
+<p>When <code>getBucketConfig("photos")</code> is called and the bucket isn't in the cache:</p>
+
+<ol>
+  <li>Check the negative cache — if the bucket was recently confirmed nonexistent, return <code>ErrNoSuchBucket</code> immediately (no filer call).</li>
+  <li>Check the positive cache. If found and not expired (60-minute TTL), return it.</li>
+  <li>Neither hit: fetch the bucket's filer entry from <code>/buckets/photos</code>.</li>
+  <li>If the filer says "not found", put the bucket in the <em>negative cache</em> (15-minute TTL) so repeated 404s don't hammer the filer.</li>
+  <li>If found, call <code>newBucketConfigFromEntry()</code> to parse the extended attributes into a BucketConfig, cache it, and return it.</li>
+</ol>
+
+<p>This is the <strong>cold-start path</strong>. It pays one filer call per new bucket, then serves from memory.</p>
+
+<h4>Path 2: Real-Time Metadata Subscription (Event-Driven)</h4>
+
+<p>At startup, every S3 API server opens a <strong>long-lived gRPC metadata subscription</strong> to the filer (<code>auth_credentials_subscribe.go:17</code>). It watches specific directories:</p>
+
+<pre><code>directoriesToWatch := []string{
+    option.BucketsPath,          // /buckets
+    filer.IamConfigDirectory,    // /etc/iam
+    filer.IamConfigDirectory+"/identities",
+    filer.IamConfigDirectory+"/policies",
+    filer.IamConfigDirectory+"/service_accounts",
+    filer.IamConfigDirectory+"/groups",
+    filer.IamConfigDirectory+"/oidc-providers",
+}</code></pre>
+
+<p>Whenever any entry in these directories is created, updated, deleted, or renamed, the filer <strong>pushes</strong> an event to the S3 API server. The <code>onBucketMetadataChange</code> handler (<code>:184</code>) then:</p>
+
+<ol>
+  <li>If <code>newEntry</code> exists: refresh the BucketRegistry and BucketConfigCache for that bucket.</li>
+  <li>If <code>newEntry</code> is nil (deletion): remove the bucket from both caches.</li>
+  <li>Also update the bucket owner index atomically.</li>
+</ol>
+
+<div class="note">
+<strong>This is why the cache TTL is 60 minutes.</strong> The TTL is a safety fallback — normal consistency comes from the push-based metadata subscription. An update to a bucket's versioning setting reaches every S3 API server within milliseconds, not minutes.
+</div>
+
+<h4>Path 3: Write-Through Invalidation</h4>
+
+<p>When the S3 API server itself modifies a bucket (e.g., PutBucketVersioning), it calls <code>updateBucketConfig()</code> (<code>s3api_bucket_config.go:482</code>). This method:</p>
+
+<ol>
+  <li>Reads the bucket entry fresh from the filer (not from cache — avoids stale data).</li>
+  <li>Applies the update function to build a new BucketConfig.</li>
+  <li>Computes a field-level diff of the extended attributes (only changed/removed keys).</li>
+  <li>Patches the bucket's filer entry with the minimal diff using <code>ObjectTransaction</code> (so concurrent writes to different fields don't race).</li>
+  <li><strong>Invalidates the cache</strong> — it removes the entry rather than updating it, because a concurrent write from another server might have changed other fields. The next read re-fetches the merged state.</li>
+</ol>
+
+<h2>Part 2: The IAM Credential Flow</h2>
+
+<h3>Where Credentials Live</h3>
+
+<p>User identities (access key + secret + permissions) are stored through a pluggable <code>CredentialManager</code>. The default backend is the <strong>filer</strong> — identities are stored as individual files under <code>/etc/iam/identities/</code>:</p>
+
+<pre><code>/etc/iam/
+  identities/
+    admin.json        → {"access_key":"...", "secret_key":"...", "actions":["Admin"]}
+    readonly.json     → {"access_key":"...", "secret_key":"...", "actions":["Read"]}
+  policies/
+    public-read.json  → {policy document JSON}
+  groups/
+    engineers.json    → {group membership}
+  service_accounts/
+  oidc-providers/</code></pre>
+
+<p>Each identity has <strong>actions</strong> (Admin, Read, Write, List, Tagging) that define what operations it can perform. If the advanced IAM integration is enabled, identities can also have <strong>inline policies</strong> and <strong>attached named policies</strong> with fine-grained resource-level permissions.</p>
+
+<h3>Loading IAM Into Memory</h3>
+
+<p><code>LoadS3ApiConfigurationFromCredentialManager()</code> (<code>auth_credentials.go:2080</code>) does a full reload:</p>
+
+<ol>
+  <li>Lists all identities from the credential store (e.g., lists <code>/etc/iam/identities/</code>).</li>
+  <li>Builds in-memory indexes:
+    <ul>
+      <li><code>accessKeyIdent</code> — O(1) lookup by access key (used in SigV4 auth)</li>
+      <li><code>nameToIdentity</code> — O(1) lookup by identity name</li>
+      <li><code>policies</code> — named policy documents</li>
+      <li><code>groups</code> — group definitions and membership</li>
+      <li><code>accounts</code> — account-level configuration</li>
+    </ul>
+  </li>
+  <li>Syncs runtime policies to the advanced IAM manager (if enabled).</li>
+</ol>
+
+<h3>Keeping IAM Consistent Across Servers</h3>
+
+<p>The same metadata subscription that refreshes bucket configs also watches <code>/etc/iam/</code>. When an IAM identity is created or modified:</p>
+
+<ol>
+  <li>The change is written to the filer (e.g., <code>/etc/iam/identities/admin.json</code>).</li>
+  <li>The filer pushes a metadata event to <strong>every subscribed S3 API server</strong>.</li>
+  <li>Each server's <code>onIamConfigChange</code> handler detects the change and calls <code>LoadS3ApiConfigurationFromCredentialManager()</code> to reload the full identity set.</li>
+  <li>Within milliseconds, all S3 API servers have the updated credentials and policies.</li>
+</ol>
+
+<div class="note">
+<strong>IAM mutations are also fanned out via gRPC</strong> when a master is configured (<code>s3api_server.go:224</code>). This provides a second propagation path for embedded IAM API writes, so an IAM user created on server A is visible on server B even before the metadata subscription catches up.
+</div>
+
+<h2>Part 3: The Owner Index</h2>
+
+<p>One more piece of metadata: the <strong>bucket owner index</strong>. When an authenticated user calls <code>ListBuckets</code>, the S3 API server needs to quickly answer "which buckets does this user own?" without scanning <em>all</em> buckets and checking each one's owner attribute.</p>
+
+<p>The owner index is maintained in two ways:</p>
+
+<ol>
+  <li><strong>On creation</strong>: <code>PutBucketHandler</code> writes the owner record immediately (<code>s3api_bucket_handlers.go:388</code>).</li>
+  <li><strong>Via subscription</strong>: <code>onBucketMetadataChange</code> calls <code>maintainBucketOwnerIndex()</code> to keep the index up to date as buckets are created, deleted, or their ownership changes on other servers.</li>
+  <li><strong>On backfill</strong>: At startup, a background goroutine reconciles the owner index with all existing buckets so no ownership records are missed.</li>
+</ol>
+
+<h2>Putting It All Together</h2>
+
+<p>Here's the lifecycle of a bucket's metadata from creation to every server reading it:</p>
+
+<pre><code>Client A (Creates bucket "photos" with versioning)
+  │
+  ├─1. S3 API Server A: mkdir("/buckets", "photos", ext={versioning:"Enabled", owner:"alice"})
+  │     └─ Filer: stores entry /buckets/photos in metadata DB
+  │
+  ├─2. S3 API Server A: writes owner index entry for alice → photos
+  │
+  ├─3. Filer: pushes metadata event to ALL subscribed S3 servers
+  │     ├─ S3 API Server A: refreshes BucketRegistry, BucketConfigCache for "photos"
+  │     └─ S3 API Server B: same — now "photos" is known on server B too (warm)
+  │
+Client B (Puts object to "photos" on Server B, milliseconds later)
+  │
+  ├─4. S3 API Server B: getBucketConfig("photos") → cache HIT
+  │     Returns: versioning=Enabled, owner=alice — no filer call needed
+  │
+  ├─5. S3 API Server B: knows versioning is enabled, creates versioned write</code></pre>
+
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="q1">
+  <h3>Q1: A bucket's versioning setting is changed on server A. How does server B learn about it?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">Server B polls the filer every 60 minutes (the TTL)</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q1')">The filer pushes a metadata subscription event to all subscribed servers, and server B's onBucketMetadataChange handler refreshes its cache</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">Server B fetches the config from server A via a peer-to-peer gRPC call</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">Server B re-reads the bucket config on the next request to that bucket (lazy-load)</button>
+  <div class="feedback" id="q1-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q1')">Check</button>
+</div>
+
+<div class="quiz" id="q2">
+  <h3>Q2: Why does updateBucketConfig() invalidate the cache instead of writing the new value?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">To save memory by forcing garbage collection of old configs</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q2')">A concurrent write from another server may have changed other fields — the next read re-fetches the merged state from the filer</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">The cache entry would be too large after serialization</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">It triggers the metadata subscription to notify other servers</button>
+  <div class="feedback" id="q2-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q2')">Check</button>
+</div>
+
+<div class="quiz" id="q3">
+  <h3>Q3: Where are S3 user credentials (access keys + secrets) stored by default?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">In the master server's Raft log, replicated across the cluster</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">In each S3 API server's local SQLite database</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q3')">As JSON files on the filer under /etc/iam/identities/, loaded into memory by each S3 API server</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">Encrypted and embedded in SigV4 request signatures</button>
+  <div class="feedback" id="q3-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q3')">Check</button>
+</div>
+
+<h2>Primary Source</h2>
+
+<p>Read the code in this order to trace the full metadata flow yourself:</p>
+<ol>
+  <li><code>weed/s3api/auth_credentials_subscribe.go</code> — the subscription engine</li>
+  <li><code>weed/s3api/s3api_bucket_config.go:359–477</code> — getBucketConfig, newBucketConfigFromEntry, updateBucketConfig</li>
+  <li><code>weed/s3api/s3api_bucket_config.go:206–334</code> — BucketConfigCache (dual LRU + negative cache)</li>
+  <li><code>weed/s3api/auth_credentials.go:46–80</code> — IdentityAccessManagement struct (the in-memory IAM state)</li>
+  <li><code>weed/credential/README.md</code> — CredentialManager pluggable backends</li>
+</ol>
+
+<h2>Next</h2>
+
+<p>In the next lesson, we'll trace a complete S3 PutObject from client to disk: how the filer breaks it into chunks, assigns file IDs via the master, and writes blobs to volume servers. We'll also explore the reader cache and the "stream from volume servers" optimization for reads.</p>
+
+<hr>
+<p><em>Questions? Ask. The <a href="../reference/glossary.html">glossary</a> and <a href="../reference/architecture.html">architecture reference</a> are always available.</em></p>
+
+<script>
+  function selectQuiz(btn, quizId) {
+    const quiz = document.getElementById(quizId);
+    quiz.querySelectorAll('.quiz-option').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+  }
+
+  function checkQuiz(quizId) {
+    const quiz = document.getElementById(quizId);
+    const selected = quiz.querySelector('.selected');
+    const feedback = document.getElementById(quizId + '-feedback');
+
+    if (!selected) {
+      feedback.textContent = 'Select an answer first.';
+      feedback.className = 'feedback show wrong';
+      return;
+    }
+
+    if (selected.dataset.answer === 'correct') {
+      selected.classList.add('correct');
+      feedback.className = 'feedback show correct';
+      feedback.textContent = 'Correct!';
+    } else {
+      selected.classList.add('wrong');
+      const correct = quiz.querySelector('[data-answer="correct"]');
+      correct.classList.add('correct');
+      feedback.className = 'feedback show wrong';
+      feedback.textContent = 'Not quite. The correct answer is highlighted in green.';
+    }
+
+    quiz.querySelector('.check-btn').disabled = true;
+  }
+</script>
+
+</body>
+</html>
