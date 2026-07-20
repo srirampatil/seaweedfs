@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 7: The Filer Meta-Log</title>
+<link rel="stylesheet" href="../assets/shared.css">
+<style>
+  .quiz { margin: 2rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+  .quiz h3 { margin-top: 0; }
+  .quiz-option { display: block; padding: 0.4rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 3px; border: 1px solid var(--border); background: var(--bg); font-family: inherit; font-size: 0.95em; color: var(--text); transition: background 0.15s; }
+  .quiz-option:hover { background: var(--accent-light); }
+  .quiz-option.correct { background: #c8e6c9; border-color: #66bb6a; }
+  .quiz-option.wrong { background: #ffcdd2; border-color: #ef5350; }
+  .feedback { margin-top: 0.5rem; padding: 0.5rem; border-radius: 3px; font-size: 0.9em; display: none; }
+  .feedback.show { display: block; }
+  .feedback.correct { background: #c8e6c9; }
+  .feedback.wrong { background: #ffcdd2; }
+  .check-btn { padding: 0.4rem 1.2rem; margin-top: 0.5rem; border: none; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; font-family: inherit; font-size: 0.9em; }
+  .check-btn:hover { opacity: 0.9; }
+  .check-btn:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+
+<h1>Lesson 7: The Filer Meta-Log</h1>
+
+<p>The meta-log is the backbone of SeaweedFS's event-driven architecture. Every change to the filer namespace — create, update, delete, rename — is recorded as a log entry. Subscribers consume this log to react to changes: the S3 API server refreshes bucket configs and IAM credentials; the lifecycle worker evaluates expiration rules; filer sync replicates across clusters.</p>
+
+<h2>What the Meta-Log Is (and Isn't)</h2>
+
+<p>The meta-log is <strong>not</strong> a separate storage subsystem. It has no WAL, no dedicated disk partition, no special ring buffer. It is simply <strong>regular files on the filer itself</strong>, written to a reserved directory tree:</p>
+
+<pre><code>/topics/.system/log/
+  2026-07-19/
+    15-13.00000001    ← YYYY-MM-DD/HH-MM.filerId
+    15-14.00000001</code></pre>
+
+<p>Each log file is a normal filer file — its content is chunked across volume servers like any other file. The only special thing about it is the path prefix.</p>
+
+<div class="note">
+<strong>No reserved storage.</strong> The log grows unboundedly as append-only files. There is no ring buffer, no retention window, no automatic truncation. Old day directories persist until something explicitly deletes them.
+</div>
+
+<h2>The LogBuffer: In-Memory First, Disk Later</h2>
+
+<p>Events don't go directly to disk. They accumulate in an in-memory <code>LogBuffer</code> (<code>util/log_buffer/log_buffer.go:62</code>):</p>
+
+<table>
+  <tr><th>Property</th><th>Value</th></tr>
+  <tr><td>Buffer size</td><td>8 MB</td></tr>
+  <tr><td>Sealed buffers retained</td><td>4 previous buffers</td></tr>
+  <tr><td>Time-based flush</td><td>Every 1 minute (<code>LogFlushInterval</code>)</td></tr>
+  <tr><td>Size-based flush</td><td>When 8 MB buffer fills before the minute ends</td></tr>
+  <tr><td>Flush queue depth</td><td>16 entries</td></tr>
+</table>
+
+<p>The buffer has two goroutines: <code>loopFlush</code> drains the flush queue and calls <code>logFlushFunc</code>, and <code>loopInterval</code> fires a time-based flush every minute. When the buffer fills mid-minute, the write path itself triggers an immediate flush.</p>
+
+<p>Four previous sealed buffers are kept in the <code>prevBuffers</code> ring. This serves newly-arriving subscribers who started reading from a timestamp that falls within one of those sealed windows — they get data from memory without needing to read persisted log files from disk.</p>
+
+<h2>Wire Format</h2>
+
+<p>Each entry in the buffer (and on disk) is:</p>
+
+<pre><code>[4-byte big-endian uint32 size][protobuf-marshaled filer_pb.LogEntry]</code></pre>
+
+<p>The <code>LogEntry</code> carries:</p>
+
+<pre><code>message LogEntry {
+    int64 ts_ns              = 1;   // event timestamp (nanoseconds)
+    int32 partition_key_hash = 2;   // hash of directory path (for sharding)
+    bytes data               = 3;   // marshaled SubscribeMetadataResponse
+    bytes key                = 4;   // the directory (partition key)
+    int64 offset             = 5;   // sequential offset within this LogBuffer
+}</code></pre>
+
+<p>The <code>data</code> field is a marshaled <code>SubscribeMetadataResponse</code> containing the actual event: old entry (nil for creates), new entry (nil for deletes), whether to delete chunks, the parent path for renames, and signatures from all filers that have applied this event.</p>
+
+<h2>Event Generation: Unconditional</h2>
+
+<p>Every mutation to the filer — every create, update, delete, and rename across the entire namespace — calls <code>NotifyUpdateEvent</code> → <code>logMetaEvent</code> → <code>AddDataToBuffer</code>. There is <strong>no gate on lifecycle policies</strong>. The meta-log is generated regardless of whether anyone is subscribed.</p>
+
+<p>Two things are excluded:</p>
+
+<ol>
+  <li><strong>SystemLogDir entries</strong> (<code>filer_notify.go:44</code>): mutations under <code>/topics/.system/log/</code> don't generate events. Without this guard, writing a log file would generate a log event, which would get logged, generating another event — infinite recursion.</li>
+  <li><strong><code>metadataEventsSuppressed</code></strong>: callers can suppress event generation via context. The MetaAggregator uses this when replaying peer events into the local store — those events already exist in the peer's log.</li>
+</ol>
+
+<h2>Durability Model: CDC, Not WAL</h2>
+
+<p>The call order in <code>CreateEntry</code> (<code>filer.go:259,278</code>) tells the story:</p>
+
+<pre><code>f.Store.InsertEntry(ctx, entry)    // ← metadata store write FIRST
+f.NotifyUpdateEvent(ctx, ...)       // ← log event SECOND</code></pre>
+
+<p>The metadata store mutation happens before the log event. If the filer crashes between these two lines, the entry is safely persisted in Postgres/Redis/LevelDB, but no log event was ever emitted.</p>
+
+<div class="note">
+<strong>CDC, not WAL.</strong> The meta-log is a change-data-capture stream built on top of the metadata store. The source of truth is the store itself. The meta-log provides <strong>at-most-once</strong> delivery with a crash-loss window of up to 1 minute (flush interval) or 8 MB (buffer size).
+</div>
+
+<h3>Why Lost Events Are Acceptable</h3>
+
+<p>Each subscriber has its own recovery mechanism that doesn't depend on a complete log:</p>
+
+<table>
+  <tr><th>Subscriber</th><th>Recovery</th><th>Cost</th></tr>
+  <tr>
+    <td>Lifecycle worker</td>
+    <td>Cold-start walker scans the full namespace; steady-state walker runs periodically (hours)</td>
+    <td>Walker throttled by <code>WalkerInterval</code> — not per-missed-event</td>
+  </tr>
+  <tr>
+    <td>S3 API config/IAM</td>
+    <td><code>LoadS3ApiConfigurationFromCredentialManager()</code> reads complete state at startup</td>
+    <td>A single full reload, then live events keep it fresh</td>
+  </tr>
+  <tr>
+    <td>Filer sync</td>
+    <td><code>TraverseBfsMetadata</code> does a full tree traversal on first peer connection</td>
+    <td>One-time, then incremental via the meta-log stream</td>
+  </tr>
+</table>
+
+<h2>CDC vs. Snapshot Diff: Correctness vs. Engineering</h2>
+
+<p>A natural question: why capture every individual change? Wouldn't periodic snapshots with diffs be more efficient?</p>
+
+<p>Upon closer analysis, the question is more nuanced than it first appears. Snapshot diffs can <strong>produce correct lifecycle outcomes</strong> because version files are self-describing — they carry their own timestamps. The differences are primarily engineering tradeoffs.</p>
+
+<h3>Why snapshot diffs CAN work for lifecycle</h3>
+
+<p>Each version file in <code>.versions/</code> carries its own metadata, written at mutation time and persisted on the entry:</p>
+
+<ul>
+  <li><code>ExtNoncurrentSinceNsKey</code> — exact nanosecond the version was demoted</li>
+  <li><code>ExtVersionIdKey</code> — the version ID</li>
+  <li><code>ExtDeleteMarkerKey</code> — whether this is a delete marker</li>
+  <li><code>Attributes.Mtime</code>, <code>Attributes.FileSize</code>, <code>ExtETagKey</code></li>
+</ul>
+
+<p>For MPU init records in <code>.uploads/</code>, the creation timestamp is on the directory entry itself. A comprehensive snapshot that lists all entries under <code>.versions/</code> and <code>.uploads/</code> can read these attributes directly — no historical reconstruction needed.</p>
+
+<p>Consider a version created and made noncurrent between snapshots:</p>
+
+<pre><code>T0 snapshot:        .versions/ has v_V1 (latest)
+T+1h: V2 replaces V1 — V1.NoncurrentSinceNs = T+1h
+T+2h: V3 replaces V2 — V2.NoncurrentSinceNs = T+2h
+T+4h snapshot:      .versions/ has v_V1, v_V2, v_V3
+                     V3 latest; V1/Noncurrent=T+1h, V2/Noncurrent=T+2h</code></pre>
+
+<p>Snapshot diff at T+4h lists all three versions. Each carries its own NoncurrentSinceNs. EvaluateAction computes due-time from the exact timestamp on the entry. <strong>Verdict: correct.</strong> Every surviving version is visible and evaluable.</p>
+
+<p>The same holds for MPU abort: the init record's creation timestamp is on the <code>.uploads/<id>/</code> directory entry. The snapshot diff reads it directly.</p>
+
+<h3>What snapshot diff misses</h3>
+
+<p>The only versions invisible to a snapshot diff are those <strong>explicitly deleted by the user</strong> within the snapshot window:</p>
+
+<pre><code>T0 snapshot:        V1 (latest), V0 (noncurrent)
+T+1h: Delete V0 — user calls DeleteObject?versionId=V0
+T+4h snapshot:      V1 (latest). V0 is gone.</code></pre>
+
+<p>But this is <strong>not a failure</strong>. The user explicitly deleted V0 — lifecycle doesn't need to expire it. The lifecycle engine garbage-collects versions the user <strong>left behind</strong>. A user-initiated delete supersedes lifecycle and removes the blob data correctly.</p>
+
+<h3>The real tradeoffs</h3>
+
+<table>
+  <tr><th></th><th>CDC (event log)</th><th>Snapshot diff</th></tr>
+  <tr><td>Lifecycle outcome</td><td>Correct</td><td>Correct (same outcome)</td></tr>
+  <tr><td>Discovery latency</td><td>Sub-second (event at mutation time)</td><td>Up to T+N (snapshot interval)</td></tr>
+  <tr><td>Scan cost</td><td>Only mutated entries matching rule prefixes</td><td>All entries in covered scope</td></tr>
+  <tr><td>NoncurrentDays precision</td><td>Nanosecond (from entry attribute)</td><td>Nanosecond (from entry attribute)</td></tr>
+  <tr><td>Infrastructure</td><td>Exists and runs today</td><td>Would need snapshot infrastructure</td></tr>
+  <tr><td>Intermediate state</td><td>Preserved in event stream</td><td>User-deleted states invisible (acceptable)</td></tr>
+</table>
+
+<p>The critical insight: <strong>each version file is self-describing.</strong> The diff doesn't need to reconstruct history — it reads the attributes written at mutation time and persisted on the entry. Snapshot diffs and CDC converge to the same lifecycle outcome; they differ only in <strong>when</strong> the evaluation happens (latency) and <strong>how much</strong> is scanned (cost).</p>
+
+<h3>Replay Efficiency</h3>
+
+<p>Snapshot diffs would eliminate the cursor-replay loop entirely. Instead of re-evaluating the same event 30 times for a 30-day rule, the diff evaluates each entry once. But the meta-log already optimizes this with cursor management:</p>
+
+<pre><code>if m.DueTime.After(runNow) {
+    skippedAny = true      // future due-time → skip
+    continue
+}
+if !stuck {
+    cursorAdvanceTo = ev.TsNs  // advance cursor only if no skipped matches
+}</code></pre>
+
+<p>The cursor only gets stuck on events that match a rule's prefix AND have a future due-time. Events outside all rule prefixes stream through freely. The ~30× re-evaluation overhead for pending-due objects is the price of event-driven evaluation; a snapshot diff would pay the price of full-scope scanning instead.</p>
+
+<h3>Mode 1: Server-Streamed (gRPC Push)</h3>
+
+<p>The <code>SubscribeMetadata</code> RPC (<code>filer.proto:75</code>) is a server-side streaming call. The client sends <code>{since_ns, path_prefix, client_id}</code> and the server:</p>
+
+<ol>
+  <li><strong>Catches up from disk</strong>: reads persisted log files from <code>since_ns</code> up to the first byte in the in-memory buffer, streaming each event.</li>
+  <li><strong>Switches to live</strong>: subscribes to the <code>LogBuffer</code>'s subscriber notification channel. New events arrive with sub-millisecond latency.</li>
+  <li><strong>Batches backlog</strong>: during catch-up, multiple events can be packed into one response via <code>SubscribeMetadataResponse.events</code>.</li>
+</ol>
+
+<h3>Mode 2: Client-Direct Volume Server Reads</h3>
+
+<p>When the client sets <code>client_supports_metadata_chunks: true</code>, the server sends <code>LogFileChunkRef</code> messages instead of streaming individual events. Each ref contains the file ID chunks for a log file. The client then:</p>
+
+<ol>
+  <li>Reads all chunk data directly from volume servers in parallel.</li>
+  <li>Decodes <code>[4-byte size | LogEntry]</code> records locally.</li>
+</ol>
+
+<p>This is the same optimization as the S3 GET path: the filer provides chunk references, and the client fetches data directly — the filer is never a byte-throughput bottleneck for historical log replay.</p>
+
+<h2>Two LogBuffers: Local vs. Aggregate</h2>
+
+<p>Each filer has <strong>two</strong> LogBuffers (<code>filer.go:52,62</code>):</p>
+
+<table>
+  <tr><th>Buffer</th><th>Name</th><th>Flush to disk?</th><th>Purpose</th></tr>
+  <tr><td><code>LocalMetaLogBuffer</code></td><td><code>"local"</code></td><td>Yes — <code>logFlushFunc</code> → <code>appendToFile</code></td><td>Records this filer's own mutations</td></tr>
+  <tr><td><code>MetaAggregator.MetaLogBuffer</code></td><td><code>"aggr"</code></td><td>No — <code>flushFn</code> is nil</td><td>Merges events from all peer filers for subscribers</td></tr>
+</table>
+
+<p>The local buffer persists to disk. The aggregate buffer is memory-only — it serves live subscribers with a merged view of all filers' events. When a subscriber needs historical data, it falls back to reading persisted log files (which come from individual filers' local buffers).</p>
+
+<h2>Multi-Filer: Peers and Merge</h2>
+
+<p>In a multi-filer deployment, the <code>MetaAggregator</code> subscribes to every peer filer via <code>SubscribeLocalMetadata</code>:</p>
+
+<ol>
+  <li>On first connection to a peer, it does a <strong>full metadata tree traversal</strong> (<code>TraverseBfsMetadata</code>) to import all pre-existing entries.</li>
+  <li>Then it subscribes to the peer's live meta-log stream.</li>
+  <li>Each received event is added to the aggregate <code>MetaLogBuffer</code> (memory only) and replayed into the local store (<code>Replay</code> function).</li>
+  <li>The peer offset (<code>TsNs</code>) is periodically persisted into the filer's KV store so the subscription can resume from the right point after restart.</li>
+</ol>
+
+<p>When reading persisted logs, an <code>OrderedLogVisitor</code> uses a <strong>min-heap priority queue</strong> across per-filer log file iterators, merging events in timestamp order.</p>
+
+<h2>Subscribers</h2>
+
+<p>The meta-log is read by many subsystems, not just the lifecycle worker:</p>
+
+<table>
+  <tr><th>Subscriber</th><th>Client name prefix</th><th>What it watches</th></tr>
+  <tr><td>S3 API server</td><td><code>"s3"</code></td><td><code>/buckets</code>, <code>/etc/iam/*</code></td></tr>
+  <tr><td>Lifecycle worker</td><td><code>"worker-s3-lifecycle-daily"</code></td><td>All paths, sharded</td></tr>
+  <tr><td>Filer sync</td><td><code>"filer:&lt;addr&gt;"</code></td><td>Full tree</td></tr>
+  <tr><td>Mount/FUSE</td><td><code>"mount"</code></td><td>Mounted subtree</td></tr>
+</table>
+
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="q1">
+  <h3>Q1: Where are meta-log events stored on disk?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">In a dedicated WAL partition on the volume servers</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">In the filer's metadata store (Postgres/Redis/etc.)</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q1')">As regular filer files under /topics/.system/log/</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">In the master server's Raft log</button>
+  <div class="feedback" id="q1-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q1')">Check</button>
+</div>
+
+<div class="quiz" id="q2">
+  <h3>Q2: Why does the filer have both a LocalMetaLogBuffer and a MetaAggregator.MetaLogBuffer?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">One is for creates, the other is for deletes</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">The local buffer is deprecated and kept for backward compatibility</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q2')">The local buffer persists to disk; the aggregate buffer merges peer events in memory for subscribers</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">The aggregate buffer compresses events before sending to volume servers</button>
+  <div class="feedback" id="q2-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q2')">Check</button>
+</div>
+
+<div class="quiz" id="q3">
+  <h3>Q3: Is the meta-log generated only when lifecycle policies are configured?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">Yes — it's a lifecycle-specific feature</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">Yes, but only when at least one subscriber is connected</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q3')">No — every filer mutation generates an entry unconditionally</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">No, but it's only generated for paths with active subscriptions</button>
+  <div class="feedback" id="q3-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q3')">Check</button>
+</div>
+
+<div class="quiz" id="q4">
+  <h3>Q4: What happens to unflushed meta-log events if the filer crashes?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q4')">They are recovered from the metadata store's WAL</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q4')">They are replayed from the master server's Raft log</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q4')">They are lost — each subscriber has its own recovery (walker, full reload, tree traversal)</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q4')">The buffer is fsynced on every write, so no events are ever lost</button>
+  <div class="feedback" id="q4-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q4')">Check</button>
+</div>
+
+<div class="quiz" id="q5">
+  <h3>Q5: What is the primary difference between CDC and snapshot diff for lifecycle evaluation?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q5')">CDC produces correct outcomes; snapshot diff cannot evaluate NoncurrentDays at all</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q5')">Snapshot diff requires the master server to participate in every evaluation</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q5')">Both produce correct outcomes; they differ in latency (event-time vs. interval) and scan cost (incremental vs. full)</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q5')">CDC stores events on volume servers; snapshot diff stores them on the filer</button>
+  <div class="feedback" id="q5-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q5')">Check</button>
+</div>
+
+<h2>Primary Source</h2>
+<ol>
+  <li><code>weed/filer/filer.go:52,95</code> — LocalMetaLogBuffer initialization</li>
+  <li><code>weed/filer/filer_notify.go:28,110</code> — NotifyUpdateEvent → logMetaEvent</li>
+  <li><code>weed/filer/filer_notify.go:158-178</code> — logFlushFunc: file path, retry loop</li>
+  <li><code>weed/filer/filer_notify_append.go:14-49</code> — appendToFile: assign→upload→create entry</li>
+  <li><code>weed/util/log_buffer/log_buffer.go:62-130</code> — LogBuffer struct and NewLogBuffer</li>
+  <li><code>weed/util/log_buffer/log_buffer.go:366-479</code> — AddDataToBuffer: marshal, flush triggers</li>
+  <li><code>weed/util/log_buffer/log_buffer.go:542-589</code> — loopFlush + loopInterval</li>
+  <li><code>weed/filer/meta_aggregator.go:39-55,135-324</code> — MetaAggregator and peer subscription</li>
+  <li><code>weed/filer/filer_notify_read.go:26-41,157-173</code> — collectPersistedLogBuffer, OrderedLogVisitor</li>
+  <li><code>weed/pb/filer.proto:613-674</code> — SubscribeMetadata protocol, LogEntry format</li>
+</ol>
+
+<hr>
+<p><em>Questions? Ask. The <a href="../reference/glossary.html">glossary</a> and <a href="../reference/architecture.html">architecture reference</a> are always available.</em></p>
+
+<script>
+  function selectQuiz(btn, quizId) {
+    const quiz = document.getElementById(quizId);
+    quiz.querySelectorAll('.quiz-option').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+  }
+  function checkQuiz(quizId) {
+    const quiz = document.getElementById(quizId);
+    const selected = quiz.querySelector('.selected');
+    const feedback = document.getElementById(quizId + '-feedback');
+    if (!selected) { feedback.textContent='Select an answer first.'; feedback.className='feedback show wrong'; return; }
+    if (selected.dataset.answer==='correct') { selected.classList.add('correct'); feedback.className='feedback show correct'; feedback.textContent='Correct!'; }
+    else { selected.classList.add('wrong'); quiz.querySelector('[data-answer="correct"]').classList.add('correct'); feedback.className='feedback show wrong'; feedback.textContent='Not quite.'; }
+    quiz.querySelector('.check-btn').disabled=true;
+  }
+</script>
+
+</body>
+</html>

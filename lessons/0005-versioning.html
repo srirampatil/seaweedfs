@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 5: Versioning Internals</title>
+<link rel="stylesheet" href="../assets/shared.css">
+<style>
+  .quiz { margin: 2rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+  .quiz h3 { margin-top: 0; }
+  .quiz-option { display: block; padding: 0.4rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 3px; border: 1px solid var(--border); background: var(--bg); font-family: inherit; font-size: 0.95em; color: var(--text); transition: background 0.15s; }
+  .quiz-option:hover { background: var(--accent-light); }
+  .quiz-option.correct { background: #c8e6c9; border-color: #66bb6a; }
+  .quiz-option.wrong { background: #ffcdd2; border-color: #ef5350; }
+  .feedback { margin-top: 0.5rem; padding: 0.5rem; border-radius: 3px; font-size: 0.9em; display: none; }
+  .feedback.show { display: block; }
+  .feedback.correct { background: #c8e6c9; }
+  .feedback.wrong { background: #ffcdd2; }
+  .check-btn { padding: 0.4rem 1.2rem; margin-top: 0.5rem; border: none; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; font-family: inherit; font-size: 0.9em; }
+  .check-btn:hover { opacity: 0.9; }
+  .check-btn:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+
+<h1>Lesson 5: Versioning Internals</h1>
+
+<p>S3 versioning preserves every version of every object. When you overwrite <code>sunset.jpg</code>, the old version isn't lost — it's kept in a <code>.versions/</code> directory alongside the new one. This lesson traces how SeaweedFS implements this entirely on the filer, with no special volume-server support.</p>
+
+<h2>Versioning States</h2>
+
+<p>A bucket can be in one of three states:</p>
+
+<table>
+  <tr><th>State</th><th>Extended attribute value</th><th>Behavior</th></tr>
+  <tr><td>Never configured</td><td><code>""</code> (absent)</td><td>PUT overwrites; DELETE removes permanently</td></tr>
+  <tr><td>Enabled</td><td><code>"Enabled"</code></td><td>PUT creates new version; DELETE creates delete marker</td></tr>
+  <tr><td>Suspended</td><td><code>"Suspended"</code></td><td>PUT overwrites null version; DELETE creates null delete marker</td></tr>
+</table>
+
+<p>Versioning is stored as an extended attribute on the bucket's filer directory entry. It's cached in <code>BucketConfig.Versioning</code> and read during every PutObject via <code>getVersioningState()</code>.</p>
+
+<h2>Storage Layout</h2>
+
+<p>When versioning is enabled on bucket <code>photos</code>, the object <code>sunset.jpg</code> lives at:</p>
+
+<pre><code>/buckets/photos/sunset.jpg              ← empty (or null version if pre-versioning)
+/buckets/photos/sunset.jpg.versions/    ← directory entry with latest-version pointer
+/buckets/photos/sunset.jpg.versions/v_0x68a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5  ← version file
+/buckets/photos/sunset.jpg.versions/v_0x68f1e2d3c4b5a6c7d8e9f0a1b2c3d4e5  ← older version</code></pre>
+
+<p>The <code>.versions/</code> suffix is the constant <code>s3_constants.VersionsFolder</code>. Version files have the prefix <code>v_</code> — the function <code>getVersionFileName(versionId)</code> returns <code>"v_" + versionId</code>.</p>
+
+<p>The <code>.versions/</code> <strong>directory itself is also a filer entry</strong> with extended attributes that act as the latest-version pointer:</p>
+
+<pre><code>// On the .versions/ directory entry:
+ExtLatestVersionIdKey      = versionId          // which version is current
+ExtLatestVersionFileNameKey = "v_0x68a1..."     // the filename of the current version
+ExtLatestVersionSizeKey     = "1048576"          // cached size (avoids getEntry during list)
+ExtLatestVersionMtimeKey    = "1721234567"       // cached mtime
+ExtLatestVersionETagKey     = "\"abc123\""       // cached ETag
+ExtLatestVersionOwnerKey    = "account123"       // cached owner
+ExtLatestVersionIsDeleteMarker = "true"          // if current is a delete marker</code></pre>
+
+<div class="note">
+<strong>Single-scan list efficiency:</strong> The cached size/mtime/ETag/owner on the <code>.versions/</code> directory entry means <code>ListObjects</code> doesn't need to fetch each version file individually. For N versioned objects, this eliminates N extra getEntry calls — the metadata is directly usable from the directory listing.
+</div>
+
+<h2>Version ID Format</h2>
+
+<p>Version IDs are 32-hex-character strings. The first 16 chars encode a <strong>timestamp</strong>, the last 16 are random bytes for uniqueness:</p>
+
+<pre><code>versionId = invertedTimestamp(16 hex) + random(16 hex)</code></pre>
+
+<p>Two formats coexist:</p>
+
+<table>
+  <tr><th>Format</th><th>Timestamp encoding</th><th>Detection</th><th>Sort order</th></tr>
+  <tr><td>New (inverted)</td><td><code>MaxInt64 - time.Now().UnixNano()</code></td><td>first 16 chars &gt; 0x4000...</td><td>Smaller value = newer (lexicographic ascending = newest-first)</td></tr>
+  <tr><td>Old (raw)</td><td><code>time.Now().UnixNano()</code></td><td>first 16 chars &lt; 0x4000...</td><td>Smaller value = older (lexicographic ascending = oldest-first)</td></tr>
+</table>
+
+<div class="note">
+<strong>Why invert the timestamp?</strong> Filer directory listings are lexicographically sorted. By using <code>MaxInt64 - nanos</code>, newer versions naturally sort first in the directory listing without any custom sorting. The <code>isNewFormatVersionId</code> function detects the format by checking if the timestamp portion exceeds a threshold.
+</div>
+
+<p>The <code>getVersionIdFormat</code> function checks the existing <code>.versions/</code> directory to determine which format to use. New <code>.versions/</code> directories always use inverted format. Existing directories inherit their format from the latest version ID already stored.</p>
+
+<h2>PutObject With Versioning Enabled</h2>
+
+<p><code>putVersionedObject</code> (<code>s3api_object_handlers_put.go:1457</code>) does NOT write to the regular object path. Instead:</p>
+
+<ol>
+  <li>Determine the version ID format (inverted or legacy).</li>
+  <li>Generate a new version ID.</li>
+  <li>Upload directly to <code>.versions/v_&lt;versionId&gt;</code> using <code>putToFiler</code>.</li>
+  <li>The <code>versionedFinalize</code> callback runs after the version file is created:
+    <ul>
+      <li><strong>Stamps the prior latest as noncurrent</strong> by writing <code>ExtNoncurrentSinceNsKey</code> on the demoted version entry — this gives the lifecycle engine an exact demotion timestamp.</li>
+      <li><strong>Updates the <code>.versions/</code> directory</strong> to point at the new version ID, file name, and cached metadata.</li>
+    </ul>
+  </li>
+</ol>
+
+<p>The regular object path (<code>/buckets/photos/sunset.jpg</code>) remains empty or carries only a pre-versioning null version. All versioned content lives under <code>.versions/</code>.</p>
+
+<h2>Delete With Versioning: Delete Markers</h2>
+
+<p>When versioning is enabled, deleting an object does NOT remove any data. Instead, it creates a <strong>delete marker</strong> — a zero-byte version file in <code>.versions/</code> with <code>ExtDeleteMarkerKey: "true"</code>:</p>
+
+<pre><code>createDeleteMarker(bucket, object):
+  1. Generate new version ID
+  2. Create v_&lt;id&gt; with ExtDeleteMarkerKey="true", zero chunks
+  3. Update .versions/ pointer to this delete marker
+  4. Set ExtLatestVersionIsDeleteMarker="true" on .versions/</code></pre>
+
+<p>On subsequent GET requests, <code>getLatestObjectVersion</code> returns the delete marker entry. The GET handler checks <code>ExtDeleteMarkerKey</code> and returns <code>ErrNoSuchKey</code> — exactly matching AWS behavior where the object appears deleted even though every historical version still exists.</p>
+
+<p>To actually remove a version, the client must call <code>DeleteObject?versionId=xxx</code>. This permanently removes that specific version file from <code>.versions/</code>.</p>
+
+<h2>GetObject With Versioning</h2>
+
+<p>The read path branches based on versioning state (<code>s3api_object_handlers.go:648</code>):</p>
+
+<p><strong>Specific version requested</strong> (<code>?versionId=xxx</code>): <code>getSpecificObjectVersion</code> looks up <code>.versions/v_xxx</code> directly — O(1) lookup.</p>
+
+<p><strong>Latest version (no versionId):</strong> <code>getLatestObjectVersion</code> reads the <code>.versions/</code> directory entry, extracts the pointer, and fetches the version file. It has a <strong>self-healing path</strong> with up to 8 retries if the pointer is stale (points to a file that no longer exists):</p>
+
+<ol>
+  <li>Try to get the <code>.versions/</code> directory entry (exponential backoff: 100ms, 200ms, 400ms...).</li>
+  <li>Read <code>ExtLatestVersionFileNameKey</code> to find the current version file name.</li>
+  <li>Fetch that version file.</li>
+  <li>If the file doesn't exist (stale pointer): <code>healStaleLatestVersionPointer</code> rescans the <code>.versions/</code> directory, finds the newest remaining entry, and updates the pointer. Returns a warning log entry so operators can track pointer drift.</li>
+</ol>
+
+<h2>Null Versions</h2>
+
+<p>The <strong>null version</strong> (<code>versionId="null"</code>) represents objects that existed before versioning was enabled, or objects in a suspended-versioning bucket. These live at the regular object path, not under <code>.versions/</code>:</p>
+
+<pre><code>/buckets/photos/sunset.jpg   ← the null version (pre-versioning object)</code></pre>
+
+<p>When versioning is first enabled on a bucket, existing objects become null versions. New PUTs go to <code>.versions/</code>. The null version at the regular path persists until explicitly deleted.</p>
+
+<h2>Deleting Specific Versions</h2>
+
+<p><code>routedDeleteSpecificVersion</code> (<code>s3api_object_versioned_finalize.go:117</code>) uses the <strong>repoint-before-delete</strong> pattern:</p>
+
+<ol>
+  <li><strong>Scan <code>.versions/</code></strong> to find the next-newest version (excluding the one being deleted).</li>
+  <li><strong>Repoint the pointer</strong> to the new latest BEFORE removing the blob. If the server crashes between steps 2 and 3, the pointer is already consistent — GETs serve the previous version or NoSuchKey correctly.</li>
+  <li><strong>Delete the version file</strong> from <code>.versions/</code>.</li>
+  <li>If this was the last version (singleton): tear down the <code>.versions/</code> directory.</li>
+</ol>
+
+<p>For a multi-filer deployment, this happens as a single <code>ObjectTransaction</code> on the key's owner filer, serialized under the per-object lock.</p>
+
+<h2>DeleteMarker and Lifeycle</h2>
+
+<p>The <code>ExtNoncurrentSinceNsKey</code> timestamp lets the lifecycle engine compute NoncurrentDays precisely. When a new version or delete marker demotes the current latest, <code>markVersionNoncurrent</code> stamps the demoted entry with the exact nanosecond of demotion.</p>
+
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="q1">
+  <h3>Q1: Where does a versioned PutObject write its data?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">Directly to /buckets/&lt;b&gt;/&lt;object&gt;, overwriting the previous version</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">To a separate volume tagged with the version ID</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q1')">To /buckets/&lt;b&gt;/&lt;object&gt;.versions/v_&lt;versionId&gt; in the filer</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">To a dedicated version-only volume server</button>
+  <div class="feedback" id="q1-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q1')">Check</button>
+</div>
+
+<div class="quiz" id="q2">
+  <h3>Q2: Why does the new version ID format use an inverted timestamp (MaxInt64 - nanos)?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">To make version IDs harder to guess for security</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q2')">So newer versions sort first in lexicographic filer directory listings</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">To compress the timestamp into fewer hex characters</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">To distinguish version IDs from regular file IDs</button>
+  <div class="feedback" id="q2-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q2')">Check</button>
+</div>
+
+<div class="quiz" id="q3">
+  <h3>Q3: What happens when you GET an object whose latest version is a delete marker?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">The most recent non-delete-marker version is served</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">An empty 200 OK with zero bytes is returned</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q3')">ErrNoSuchKey is returned — the object appears deleted</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">The delete marker itself is served as a 0-byte file</button>
+  <div class="feedback" id="q3-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q3')">Check</button>
+</div>
+
+<h2>Primary Source</h2>
+<ol>
+  <li><code>weed/s3api/s3api_object_handlers_put.go:1457</code> — <code>putVersionedObject</code></li>
+  <li><code>weed/s3api/s3api_version_id.go</code> — version ID generation, format detection, comparison</li>
+  <li><code>weed/s3api/s3api_object_versioning.go:194</code> — <code>createDeleteMarker</code></li>
+  <li><code>weed/s3api/s3api_object_versioning.go:1724</code> — <code>getLatestObjectVersion</code> (with self-healing)</li>
+  <li><code>weed/s3api/s3api_object_versioning.go:1035</code> — <code>getSpecificObjectVersion</code></li>
+  <li><code>weed/s3api/s3api_object_versioned_finalize.go</code> — <code>routedVersionedFinalize</code>, <code>latestPointerRecompute</code>, <code>routedDeleteSpecificVersion</code></li>
+  <li><code>weed/s3api/s3api_object_versioning.go:1191</code> — <code>repointLatestBeforeDeletion</code></li>
+  <li><code>weed/s3api/s3api_object_versioning.go:1937</code> — <code>healStaleLatestVersionPointer</code> (self-healing)</li>
+</ol>
+
+<hr>
+<p><em>Questions? Ask. The <a href="../reference/glossary.html">glossary</a> and <a href="../reference/architecture.html">architecture reference</a> are always available.</em></p>
+
+<script>
+  function selectQuiz(btn, quizId) {
+    const quiz = document.getElementById(quizId);
+    quiz.querySelectorAll('.quiz-option').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+  }
+  function checkQuiz(quizId) {
+    const quiz = document.getElementById(quizId);
+    const selected = quiz.querySelector('.selected');
+    const feedback = document.getElementById(quizId + '-feedback');
+    if (!selected) { feedback.textContent='Select an answer first.'; feedback.className='feedback show wrong'; return; }
+    if (selected.dataset.answer==='correct') { selected.classList.add('correct'); feedback.className='feedback show correct'; feedback.textContent='Correct!'; }
+    else { selected.classList.add('wrong'); quiz.querySelector('[data-answer="correct"]').classList.add('correct'); feedback.className='feedback show wrong'; feedback.textContent='Not quite.'; }
+    quiz.querySelector('.check-btn').disabled=true;
+  }
+</script>
+
+</body>
+</html>

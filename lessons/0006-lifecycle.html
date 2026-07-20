@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lesson 6: Lifecycle Policy Processing</title>
+<link rel="stylesheet" href="../assets/shared.css">
+<style>
+  .quiz { margin: 2rem 0; padding: 1rem; border: 1px solid var(--border); border-radius: 6px; }
+  .quiz h3 { margin-top: 0; }
+  .quiz-option { display: block; padding: 0.4rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 3px; border: 1px solid var(--border); background: var(--bg); font-family: inherit; font-size: 0.95em; color: var(--text); transition: background 0.15s; }
+  .quiz-option:hover { background: var(--accent-light); }
+  .quiz-option.correct { background: #c8e6c9; border-color: #66bb6a; }
+  .quiz-option.wrong { background: #ffcdd2; border-color: #ef5350; }
+  .feedback { margin-top: 0.5rem; padding: 0.5rem; border-radius: 3px; font-size: 0.9em; display: none; }
+  .feedback.show { display: block; }
+  .feedback.correct { background: #c8e6c9; }
+  .feedback.wrong { background: #ffcdd2; }
+  .check-btn { padding: 0.4rem 1.2rem; margin-top: 0.5rem; border: none; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; font-family: inherit; font-size: 0.9em; }
+  .check-btn:hover { opacity: 0.9; }
+  .check-btn:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+
+<h1>Lesson 6: Lifecycle Policy Processing</h1>
+
+<p>S3 lifecycle policies automatically expire objects, delete old versions, and abort abandoned multipart uploads. SeaweedFS implements this as a <strong>two-pronged system</strong>: an event-driven meta-log replay for continuous evaluation, and a periodic bucket walker for bootstrap and rules that can't be driven by events alone.</p>
+
+<h2>Lifecycle Rule Evaluation</h2>
+
+<p>Rules are stored as XML on the bucket (<code>PutBucketLifecycleConfiguration</code>) and parsed into a flat <code>Rule</code> struct (<code>s3lifecycle/rule.go:7</code>):</p>
+
+<pre><code>type Rule struct {
+    ID     string
+    Status string   // "Enabled" | "Disabled"
+    Prefix string
+    FilterTags map[string]string
+    FilterSizeGreaterThan int64
+    FilterSizeLessThan    int64
+
+    ExpirationDays            int
+    ExpirationDate            time.Time
+    ExpiredObjectDeleteMarker bool
+    NoncurrentVersionExpirationDays int
+    NewerNoncurrentVersions         int
+    AbortMPUDaysAfterInitiation     int
+}</code></pre>
+
+<p><code>EvaluateAction</code> (<code>s3lifecycle/evaluate.go:12</code>) checks whether a rule fires for a given object at a given time. Each action kind has different gating:</p>
+
+<table>
+  <tr><th>Action kind</th><th>Gates</th><th>Action</th></tr>
+  <tr><td><code>ExpirationDays</code></td><td>IsLatest, is not delete marker, ModTime + Days &leq; now</td><td>Delete object (respecting versioning state)</td></tr>
+  <tr><td><code>ExpirationDate</code></td><td>IsLatest, is not delete marker, now &geq; ExpirationDate</td><td>Delete object</td></tr>
+  <tr><td><code>NoncurrentDays</code></td><td>NOT IsLatest, SuccessorModTime + Days &leq; now, optionally gated by NewerNoncurrent</td><td>Delete specific version</td></tr>
+  <tr><td><code>NewerNoncurrent</code></td><td>NOT IsLatest, NoncurrentIndex &geq; count, no NoncurrentDays</td><td>Delete specific version</td></tr>
+  <tr><td><code>ExpiredDeleteMarker</code></td><td>IsLatest, is delete marker, NumVersions == 1</td><td>Remove the delete marker</td></tr>
+  <tr><td><code>AbortMPU</code></td><td>IsMPUInit=true, ModTime + Days &leq; now</td><td>Abort multipart upload</td></tr>
+</table>
+
+<div class="note">
+<strong>NoncurrentDays relies on <code>SuccessorModTime</code></strong>, not the version's own ModTime. When a new version replaces this one, <code>markVersionNoncurrent</code> stamps <code>ExtNoncurrentSinceNs</code> on the demoted entry. If that timestamp exists, it's used as SuccessorModTime; otherwise the engine falls back to the version's own mtime (older code paths).
+</div>
+
+<h2>Architecture: Five Components</h2>
+
+<div class="arch-layer">1. Engine — Rule Compilation</div>
+<div class="arch-description">Compiles enabled rules into an in-memory <code>Snapshot</code>. Pre-builds delay-grouped action indexes so matching is O(1) per event. Computes content hashes to detect rule changes. Splits rules into replay-eligible (event-driven) and walker-only partitions.</div>
+
+<div class="arch-layer">2. Reader — Meta-Log Subscription</div>
+<div class="arch-description">Subscribes to the filer meta-log via gRPC. One shared subscription for all shards. Emits <code>Event</code> structs (TsNs, Bucket, Key, OldEntry, NewEntry) to a fan-out channel. Events carry pre-computed sibling state for versioned objects.</div>
+
+<div class="arch-layer">3. Router — Match Events to Rules</div>
+<div class="arch-description">Receives events from the reader. For each event, looks up matching rules from the engine snapshot. Evaluates each (rule, kind, event) tuple via <code>EvaluateAction</code>. Produces <code>Match</code> tuples with DueTime, ObjectKey, VersionID, Identity for CAS.</div>
+
+<div class="arch-layer">4. Daily Run — Orchestration</div>
+<div class="arch-description">Orchestrates per-shard replay and periodic walking. One goroutine per shard. Each shard: runs recovery/cold-start walker if needed → runs steady-state walker (throttled) → drains events from its channel → routes matches → dispatches via LifecycleDelete RPC → persists cursor.</div>
+
+<div class="arch-layer">5. S3 API Server — LifecycleDelete Handler</div>
+<div class="arch-description">Receives <code>LifecycleDelete</code> RPC: re-fetches the live entry → verifies identity CAS (MtimeNs, Size, HeadFid, ExtendedHash) → checks object lock → dispatches by action kind to actual S3 operations.</div>
+
+<h2>Event-Driven Replay: The Meta-Log Path</h2>
+
+<p>This is the primary evaluation path for time-based rules (ExpirationDays, NoncurrentDays, AbortMPU). It works by subscribing to the filer's meta-log:</p>
+
+<ol>
+  <li><strong>Shared subscription</strong>: One gRPC stream subscribes to all shards. A fan-out goroutine routes events to per-shard channels by <code>ev.ShardID</code>.</li>
+  <li><strong>Shard draining</strong>: Each shard goroutine drains events from its channel up to <code>runNow</code> (the pass boundary). Events past <code>runNow</code> cancel the reader — they will be picked up on the next pass.</li>
+  <li><strong>Due-time calculation</strong>: The router skips events whose ModTime + rule TTL hasn't yet exceeded <code>runNow</code>. Events whose due time lies in the future stay in the meta-log for future passes.</li>
+  <li><strong>Cursor advancement</strong>: After draining, the per-shard cursor is persisted with <code>TsNs</code> (last processed event timestamp), <code>RuleSetHash</code>, and <code>PromotedHash</code>. Next pass resumes from here.</li>
+</ol>
+
+<h2>The Walker: Bootstrap and Replay-Gap Coverage</h2>
+
+<p>Not all actions can be driven by meta-log events alone. The <strong>walker</strong> (<code>dailyrun/walk_buckets.go</code>) does a full bucket subtree scan to cover:</p>
+
+<ul>
+  <li><strong>ExpirationDate rules</strong> — a fixed calendar date. The object's ModTime is irrelevant; what matters is "is now past 2026-12-31?" This can't be expressed as a meta-log TTL.</li>
+  <li><strong>ExpiredDeleteMarker rules</strong> — requires knowing NumVersions, which the meta-log event alone doesn't carry.</li>
+  <li><strong>NewerNoncurrent (count-based)</strong> — requires knowing NoncurrentIndex, which needs sibling listing.</li>
+  <li><strong>Cold start / rule change</strong> — objects PUT before the rule existed have no meta-log event within the replay window. The walker catches them.</li>
+</ul>
+
+<p>The walker runs on its own <strong>throttled cadence</strong> (<code>WalkerInterval</code>). It's not triggered every pass — typically hours between walks for production clusters. The walker dispatches via the same <code>LifecycleDelete</code> RPC, but without identity CAS (the server trusts bootstrap calls from a fresh scan).</p>
+
+<h2>Sharding and Parallelism</h2>
+
+<p>Rules and objects are sharded across <code>ShardCount</code> partitions (default 16). Each shard has:</p>
+
+<ul>
+  <li>Its own <strong>cursor</strong> (<code>TsNs</code> — position in the meta-log stream)</li>
+  <li>Its own <strong>goroutine</strong> in the daily run</li>
+  <li>Its own <strong>event channel</strong> (buffer 256)</li>
+</ul>
+
+<p>This means 16 shards can replay the meta-log in parallel, with dispatch rate-limited by a shared <code>rate.Limiter</code>. The fan-out from the single subscription to per-shard channels is lock-free via <code>select</code>.</p>
+
+<h2>Identity CAS: Preventing Stale Dispatch</h2>
+
+<p>Between rule evaluation (router) and dispatch (server), the object might have been modified. To prevent dispatching on the wrong version:</p>
+
+<ol>
+  <li>The router captures an <code>EntryIdentity</code> at match time: <code>{MtimeNs, Size, HeadFid, ExtendedHash}</code>.</li>
+  <li>This identity is serialized into the <code>LifecycleDelete</code> RPC.</li>
+  <li>On the server, <code>LifecycleDelete</code> re-fetches the live entry and compares identities.</li>
+  <li>If identities don't match → <code>NOOP_RESOLVED: STALE_IDENTITY</code>. The object has moved on; the old deletion verdict is discarded.</li>
+</ol>
+
+<p>This is a <strong>compare-and-swap</strong> pattern: the server only acts if the entry at dispatch time matches the entry at evaluation time.</p>
+
+<h2>Server-Side Dispatch</h2>
+
+<p><code>LifecycleDelete</code> (<code>s3api_internal_lifecycle.go:22</code>) handles the actual deletion:</p>
+
+<table>
+  <tr><th>ActionKind</th><th>Versioning enabled</th><th>Versioning suspended</th><th>No versioning</th></tr>
+  <tr><td>Expiration</td><td>Create delete marker</td><td>Delete null + create delete marker</td><td>Delete object</td></tr>
+  <tr><td>Noncurrent</td><td colspan="3">Delete specific version file <code>.versions/v_&lt;id&gt;</code></td></tr>
+  <tr><td>ExpiredDeleteMarker</td><td colspan="3">Delete the marker version file</td></tr>
+  <tr><td>AbortMPU</td><td colspan="3">Delete <code>.uploads/&lt;id&gt;/</code> directory</td></tr>
+</table>
+
+<p>Before acting, the server also checks <strong>object lock protections</strong> — lifecycle never bypasses governance or compliance retention.</p>
+
+<h2>Fast-Path: Volume TTL</h2>
+
+<p>For simple <code>Expiration.Days</code> rules on non-versioned buckets, SeaweedFS has an optional fast path: the lifecycle TTL is stamped directly onto volume server blobs at write time. When the TTL expires, the volume server reclaims the space automatically — no lifecycle worker involvement needed. This is opt-in per bucket (<code>ExtLifecycleTtlFastPathKey</code>).</p>
+
+<h2>Knowledge Check</h2>
+
+<div class="quiz" id="q1">
+  <h3>Q1: Why does the lifecycle system need both event-driven replay AND a bucket walker?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">The walker is a legacy path kept for backward compatibility</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q1')">Some rules (ExpirationDate, ExpiredDeleteMarker) can't be driven by meta-log events alone</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">The walker is faster than event-driven evaluation for all rule types</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q1')">The walker handles noncurrent version cleanup which meta-log can't see</button>
+  <div class="feedback" id="q1-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q1')">Check</button>
+</div>
+
+<div class="quiz" id="q2">
+  <h3>Q2: What is the purpose of identity CAS in LifecycleDelete?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">To verify the caller has IAM permission to delete</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q2')">To ensure the object hasn't changed between evaluation and dispatch time</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">To deduplicate multiple lifecycle workers processing the same object</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q2')">To validate that the rule's hash matches the bucket's current policy</button>
+  <div class="feedback" id="q2-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q2')">Check</button>
+</div>
+
+<div class="quiz" id="q3">
+  <h3>Q3: What happens when a versioned bucket's Expiration.Days rule fires?</h3>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">The object is permanently deleted from .versions/</button>
+  <button class="quiz-option" data-answer="correct" onclick="selectQuiz(this, 'q3')">A delete marker is created — the object appears deleted but versions remain</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">The object is moved to a cold storage tier</button>
+  <button class="quiz-option" data-answer="wrong" onclick="selectQuiz(this, 'q3')">All versions are expired and the .versions/ directory is removed</button>
+  <div class="feedback" id="q3-feedback"></div>
+  <button class="check-btn" onclick="checkQuiz('q3')">Check</button>
+</div>
+
+<h2>Primary Source</h2>
+<ol>
+  <li><code>weed/s3api/s3lifecycle/rule.go</code> — Rule and ObjectInfo structs</li>
+  <li><code>weed/s3api/s3lifecycle/evaluate.go</code> — EvaluateAction: the core decision function</li>
+  <li><code>weed/s3api/s3lifecycle/engine/match.go</code> — Engine snapshot, MatchOriginalWrite, delay groups</li>
+  <li><code>weed/s3api/s3lifecycle/reader/reader.go</code> — Meta-log reader, Event struct</li>
+  <li><code>weed/s3api/s3lifecycle/router/router.go:80</code> — Route: match events to rules</li>
+  <li><code>weed/s3api/s3lifecycle/dailyrun/run.go:103</code> — Run: the main daily orchestration loop</li>
+  <li><code>weed/s3api/s3lifecycle/dailyrun/dispatch.go</code> — dispatchWithRetry, buildDeleteRequest</li>
+  <li><code>weed/s3api/s3lifecycle/dailyrun/walk_buckets.go</code> — Walker: full bucket scan</li>
+  <li><code>weed/s3api/s3api_internal_lifecycle.go:22</code> — LifecycleDelete: server-side handler</li>
+</ol>
+
+<hr>
+<p><em>Questions? Ask. The <a href="../reference/glossary.html">glossary</a> and <a href="../reference/architecture.html">architecture reference</a> are always available.</em></p>
+
+<script>
+  function selectQuiz(btn, quizId) {
+    const quiz = document.getElementById(quizId);
+    quiz.querySelectorAll('.quiz-option').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+  }
+  function checkQuiz(quizId) {
+    const quiz = document.getElementById(quizId);
+    const selected = quiz.querySelector('.selected');
+    const feedback = document.getElementById(quizId + '-feedback');
+    if (!selected) { feedback.textContent='Select an answer first.'; feedback.className='feedback show wrong'; return; }
+    if (selected.dataset.answer==='correct') { selected.classList.add('correct'); feedback.className='feedback show correct'; feedback.textContent='Correct!'; }
+    else { selected.classList.add('wrong'); quiz.querySelector('[data-answer="correct"]').classList.add('correct'); feedback.className='feedback show wrong'; feedback.textContent='Not quite.'; }
+    quiz.querySelector('.check-btn').disabled=true;
+  }
+</script>
+
+</body>
+</html>
